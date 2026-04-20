@@ -30,7 +30,9 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
+import time
 import traceback
 import uuid
 from datetime import datetime, timezone
@@ -56,6 +58,19 @@ except ImportError:
         },
     )  # type: ignore[assignment]
 
+# Capture pristine ``websockets.connect`` at our import time so dingtalk-stream
+# always uses the original even if another module (e.g. the Feishu adapter)
+# later monkey-patches the global ``websockets.connect`` with an ``async def``
+# wrapper — that turns the return value into a coroutine and breaks the SDK's
+# ``async with websockets.connect(uri)`` at dingtalk_stream/stream.py:74.
+try:
+    import websockets as _pristine_ws_module
+
+    _PRISTINE_WEBSOCKETS_CONNECT = _pristine_ws_module.connect
+except ImportError:
+    _pristine_ws_module = None  # type: ignore[assignment]
+    _PRISTINE_WEBSOCKETS_CONNECT = None  # type: ignore[assignment]
+
 try:
     import httpx
 
@@ -63,6 +78,37 @@ try:
 except ImportError:
     HTTPX_AVAILABLE = False
     httpx = None  # type: ignore[assignment]
+
+
+_WS_PROXY_INSTALLED = False
+
+
+def _install_dingtalk_websockets_proxy() -> None:
+    """Point dingtalk_stream.stream.websockets at a namespace holding the
+    pristine ``connect`` captured at our import time.
+
+    Idempotent. Safe no-op when dingtalk-stream or websockets is unavailable.
+    """
+    global _WS_PROXY_INSTALLED
+    if _WS_PROXY_INSTALLED:
+        return
+    if _PRISTINE_WEBSOCKETS_CONNECT is None or dingtalk_stream is None:
+        return
+    try:
+        import types
+
+        from dingtalk_stream import stream as _dts_stream
+
+        _dts_stream.websockets = types.SimpleNamespace(
+            connect=_PRISTINE_WEBSOCKETS_CONNECT,
+            exceptions=_pristine_ws_module.exceptions,
+        )
+        _WS_PROXY_INSTALLED = True
+    except Exception:  # pragma: no cover - defensive
+        logger.debug(
+            "[DingTalk] failed to install websockets proxy on dingtalk_stream.stream",
+            exc_info=True,
+        )
 
 # Card SDK for AI Cards (following QwenPaw pattern)
 try:
@@ -103,11 +149,603 @@ RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 _SESSION_WEBHOOKS_MAX = 500
 _DINGTALK_WEBHOOK_RE = re.compile(r'^https://(?:api|oapi)\.dingtalk\.com/')
 
+# AI Card streaming_update QPS guard.  The DingTalk gateway returns HTTP 403
+# "concurrent update" when multiple edit_message calls hit the same card
+# within ~500ms.  Reference (openclaw-connector reply-dispatcher.ts:103) uses
+# 800ms as the per-card minimum interval between non-finalize edits.  We
+# match that to avoid the same 403 storm.  Finalize edits are NEVER
+# throttled — dropping them would leave the card stuck in streaming state.
+_CARD_EDIT_THROTTLE_MS = 800
+# Error-send cooldown so repeated failures don't spam users
+# (reply-dispatcher.ts:108 uses 60s — same pattern, same reason).
+_ERROR_COOLDOWN_MS = 60_000
+
+# Global token-bucket rate for AI Card streaming_update across ALL chats.
+# DingTalk's official cap is ~40 QPS per tenant; reference connector
+# (messaging/card.ts:18) uses 20 as a safety margin.  Matching that, so
+# concurrent sessions never bust the tenant-wide ceiling.
+_CARD_API_MAX_QPS = 20
+_CARD_API_QPS_BACKOFF_MS = 2_000
+
+# Inbound-message queue TTL.  queueKey entries that haven't received a new
+# message for this long are eligible for sweep (reference
+# core/message-handler.ts:92 uses 5 min).
+_INBOUND_QUEUE_TTL_SEC = 300
+# Busy-ACK phrases when inbound queue already has a pending task.  Picked
+# randomly so repeats don't feel scripted (reference utils/constants.ts
+# QUEUE_BUSY_ACK_PHRASES).
+_QUEUE_BUSY_ACK_PHRASES = (
+    "收到，让我先把前一条处理完 🙏",
+    "稍等，排队中……",
+    "收到～手头这条完事就来",
+    "别急，按顺序处理中",
+)
+
+
+class _CardTokenBucket:
+    """Global async token bucket for DingTalk card streaming_update.
+
+    Mirrors messaging/card.ts:23-95.  All streamAICard/edit_message calls
+    across every chat + account share one bucket so concurrent sessions
+    don't blow past the tenant-wide QPS limit and trigger 403 storms.
+    Refills at ``rate`` tokens/second with capacity = rate.  On an
+    upstream 403 limit, callers call ``trigger_backoff`` and subsequent
+    acquirers wait out the backoff window.
+    """
+
+    def __init__(self, rate: float) -> None:
+        self._rate = float(rate)
+        self._tokens = float(rate)
+        self._last_refill = time.monotonic()
+        self._backoff_until = 0.0
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            if now < self._backoff_until:
+                await asyncio.sleep(self._backoff_until - now)
+                now = time.monotonic()
+            elapsed = now - self._last_refill
+            self._tokens = min(self._rate, self._tokens + elapsed * self._rate)
+            self._last_refill = now
+            if self._tokens < 1.0:
+                wait_s = (1.0 - self._tokens) / self._rate
+                await asyncio.sleep(wait_s)
+                self._tokens = 0.0
+                self._last_refill = time.monotonic()
+            else:
+                self._tokens -= 1.0
+
+    def trigger_backoff(self) -> None:
+        self._backoff_until = time.monotonic() + _CARD_API_QPS_BACKOFF_MS / 1000.0
+
+
+# Process-wide card-API rate limiter (shared across adapters).
+_CARD_BUCKET = _CardTokenBucket(_CARD_API_MAX_QPS)
+
+# DingTalk OpenAPI endpoints for proactive (non-session-webhook) messaging.
+_DINGTALK_OAUTH_TOKEN_URL = "https://api.dingtalk.com/v1.0/oauth2/accessToken"
+_DINGTALK_OAPI_TOKEN_URL = "https://oapi.dingtalk.com/gettoken"  # legacy, for /media/upload
+_DINGTALK_OAPI_MEDIA_UPLOAD_URL = "https://oapi.dingtalk.com/media/upload"
+_DINGTALK_OTO_BATCH_SEND_URL = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
+_DINGTALK_GROUP_SEND_URL = "https://api.dingtalk.com/v1.0/robot/groupMessages/send"
+
+# Process-wide access token cache: (client_id) -> (token, expires_at_ts).
+# Tokens are valid for ~2h; we refresh with a 5-minute safety margin so parallel
+# sends share one round-trip.  Two caches because /media/upload needs the
+# legacy OAPI token (different endpoint, different token) — matches the
+# reference connector's getAccessToken / getOapiAccessToken split.
+_DINGTALK_TOKEN_CACHE: Dict[str, tuple[str, float]] = {}
+_DINGTALK_OAPI_TOKEN_CACHE: Dict[str, tuple[str, float]] = {}
+_DINGTALK_TOKEN_LOCK = asyncio.Lock()
+_DINGTALK_OAPI_TOKEN_LOCK = asyncio.Lock()
+_DINGTALK_TOKEN_SAFETY_MARGIN = 300.0  # refresh 5 min before expiry
+
+# Media upload limits.  DingTalk /media/upload caps at 20 MB per file.
+_DINGTALK_MEDIA_MAX_SIZE = 20 * 1024 * 1024
+# File-extension → (media_type, msg_key) routing for /media/upload.
+_IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"})
+_VIDEO_EXTS = frozenset({".mp4", ".mov", ".avi", ".mkv", ".webm"})
+_VOICE_EXTS = frozenset({".amr", ".mp3", ".wav", ".aac", ".m4a", ".ogg"})
+
+# LWCP-encoded sender_id (opaque DingTalk-internal form).  Treated as OTO but
+# the OpenAPI will reject it as ``staffId.notExisted`` unless the caller has
+# resolved it to a real staffId via the contact APIs first.
+_LWCP_SENDER_RE = re.compile(r'^\$:LWCP_')
+# Real openConversationId (group chat): ``cid...==`` base64-padded form.
+_OPEN_CONVERSATION_RE = re.compile(r'^cid[A-Za-z0-9+/_\-]+={0,2}$')
+
 # DingTalk message type → runtime content type
 DINGTALK_TYPE_MAPPING = {
     "picture": "image",
     "voice": "audio",
 }
+
+
+async def _dingtalk_fetch_access_token(
+    client_id: str, client_secret: str
+) -> str:
+    """Return a cached DingTalk accessToken, refreshing if near expiry.
+
+    Uses ``/v1.0/oauth2/accessToken`` directly (no SDK dependency) so the
+    ``send_message`` tool can call this without opening a Stream WebSocket
+    that would conflict with the running gateway's exclusive connection.
+    """
+    if not HTTPX_AVAILABLE:
+        raise RuntimeError("httpx not installed")
+
+    now = datetime.now(tz=timezone.utc).timestamp()
+    cached = _DINGTALK_TOKEN_CACHE.get(client_id)
+    if cached and cached[1] - _DINGTALK_TOKEN_SAFETY_MARGIN > now:
+        return cached[0]
+
+    async with _DINGTALK_TOKEN_LOCK:
+        cached = _DINGTALK_TOKEN_CACHE.get(client_id)
+        if cached and cached[1] - _DINGTALK_TOKEN_SAFETY_MARGIN > now:
+            return cached[0]
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                _DINGTALK_OAUTH_TOKEN_URL,
+                json={"appKey": client_id, "appSecret": client_secret},
+            )
+        resp.raise_for_status()
+        body = resp.json()
+        token = body.get("accessToken") or ""
+        expires_in = body.get("expireIn") or body.get("expires_in") or 7200
+        if not token:
+            raise RuntimeError(
+                f"DingTalk accessToken response missing token: {body}"
+            )
+        _DINGTALK_TOKEN_CACHE[client_id] = (
+            token, now + float(expires_in),
+        )
+        return token
+
+
+async def _dingtalk_fetch_oapi_token(
+    client_id: str, client_secret: str,
+) -> Optional[str]:
+    """Fetch the legacy OAPI accessToken (for /media/upload).
+
+    DingTalk has two parallel token systems:
+      - ``/v1.0/oauth2/accessToken``  — new, for message OpenAPI
+      - ``/gettoken``                 — legacy OAPI, for /media/upload
+    Cached separately because they're different endpoints returning
+    different tokens.  Returns None on any failure (non-fatal —
+    callers should fall back to text-only).
+    """
+    if not HTTPX_AVAILABLE:
+        return None
+    now = datetime.now(tz=timezone.utc).timestamp()
+    cached = _DINGTALK_OAPI_TOKEN_CACHE.get(client_id)
+    if cached and cached[1] - _DINGTALK_TOKEN_SAFETY_MARGIN > now:
+        return cached[0]
+
+    async with _DINGTALK_OAPI_TOKEN_LOCK:
+        cached = _DINGTALK_OAPI_TOKEN_CACHE.get(client_id)
+        if cached and cached[1] - _DINGTALK_TOKEN_SAFETY_MARGIN > now:
+            return cached[0]
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(
+                    _DINGTALK_OAPI_TOKEN_URL,
+                    params={"appkey": client_id, "appsecret": client_secret},
+                )
+            body = resp.json()
+            if body.get("errcode") != 0 or not body.get("access_token"):
+                return None
+            token = str(body["access_token"])
+            expires_in = float(body.get("expires_in") or 7200)
+            _DINGTALK_OAPI_TOKEN_CACHE[client_id] = (
+                token, now + expires_in,
+            )
+            return token
+        except Exception:
+            return None
+
+
+def _classify_media_kind(path: str) -> str:
+    """Return one of 'image' / 'voice' / 'video' / 'file' for a local path."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in _IMAGE_EXTS:
+        return "image"
+    if ext in _VOICE_EXTS:
+        return "voice"
+    if ext in _VIDEO_EXTS:
+        return "video"
+    return "file"
+
+
+async def _dingtalk_upload_media(
+    *,
+    oapi_token: str,
+    file_path: str,
+    media_kind: str,
+) -> Optional[str]:
+    """Upload a local file to DingTalk /media/upload.
+
+    Returns the raw ``media_id`` on success (preserving the leading ``@``
+    when present), or None on failure.
+
+    Caller is responsible for shaping the id per msgKey:
+      - ``sampleImageMsg.photoURL``   → ``@<raw>``  (raw mediaId, NOT the
+        CDN download URL — the CDN URL renders as a white placeholder in
+        the DingTalk client; reference messaging.ts:714-719)
+      - ``sampleFile.mediaId``        → ``@<raw>``
+      - ``sampleAudio.mediaId``       → ``@<raw>``
+      - ``sampleVideo.videoMediaId``  → ``@<raw>``
+
+    Matches the reference connector's ``uploadMediaToDingTalk``
+    (media/common.ts:65).  Large-file chunked upload (>20MB) not yet
+    ported — callers should pre-split or downscale.
+    """
+    if not HTTPX_AVAILABLE:
+        return None
+    if not os.path.exists(file_path):
+        return None
+    size = os.path.getsize(file_path)
+    if size > _DINGTALK_MEDIA_MAX_SIZE:
+        logger.warning(
+            "[dingtalk] media file %s is %d bytes, exceeds 20MB limit",
+            file_path, size,
+        )
+        return None
+
+    ext = os.path.splitext(file_path)[1].lower()
+    if media_kind == "image":
+        content_type = "image/png" if ext == ".png" else "image/jpeg"
+    elif media_kind == "video":
+        content_type = "video/mp4" if ext == ".mp4" else "video/quicktime"
+    elif media_kind == "voice":
+        content_type = "audio/mpeg" if ext == ".mp3" else "audio/amr"
+    else:
+        content_type = "application/octet-stream"
+
+    # DingTalk OAPI quirk: videos must be uploaded with type=file
+    # (reference: media/common.ts:141).
+    upload_type = "file" if media_kind == "video" else media_kind
+
+    try:
+        with open(file_path, "rb") as fh:
+            files = {
+                "media": (
+                    os.path.basename(file_path),
+                    fh,
+                    content_type,
+                ),
+            }
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(
+                    _DINGTALK_OAPI_MEDIA_UPLOAD_URL,
+                    params={"access_token": oapi_token, "type": upload_type},
+                    files=files,
+                )
+        body = resp.json()
+        if body.get("errcode") != 0:
+            logger.warning(
+                "[dingtalk] /media/upload errcode=%s errmsg=%s",
+                body.get("errcode"), body.get("errmsg"),
+            )
+            return None
+        media_id = body.get("media_id") or ""
+        return media_id or None
+    except Exception as e:
+        logger.warning("[dingtalk] /media/upload failed: %s", e)
+        return None
+
+
+def _dingtalk_classify_chat_id(chat_id: str) -> tuple[str, str]:
+    """Classify a DingTalk chat_id into (bucket, resolved_id).
+
+    Accepts the same target-prefix convention the dingtalk-openclaw-connector
+    reference uses (``src/services/messaging.ts:sendTextToDingTalk``):
+
+    - ``"group:<openConversationId>"`` → group
+    - ``"user:<staffId>"``              → oto
+    - ``"cid...=="``                    → group (auto-detect)
+    - ``"$:LWCP_..."``                  → lwcp (fast-fail, needs contact perms)
+    - anything else                     → oto (assume staffId)
+
+    Returns ``(bucket, id)`` where ``id`` is the stripped value to put into
+    the OpenAPI payload.
+    """
+    if not chat_id:
+        return "oto", ""
+    if chat_id.startswith("group:"):
+        return "group", chat_id[6:]
+    if chat_id.startswith("user:"):
+        return "oto", chat_id[5:]
+    if _LWCP_SENDER_RE.match(chat_id):
+        return "lwcp", chat_id
+    if _OPEN_CONVERSATION_RE.match(chat_id):
+        return "group", chat_id
+    return "oto", chat_id
+
+
+# Smart markdown detection — content contains any of these characters/leading
+# markers, assume markdown and upgrade msgKey to sampleMarkdown (reference:
+# messaging.ts:820-826).  Plain-text prose uses sampleText so DingTalk's
+# client renders it without extra padding/heading inference.
+_MARKDOWN_LEADING_RE = re.compile(r'^[#*>\-]')
+_MARKDOWN_INLINE_RE = re.compile(r'[*_`#\[\]]')
+
+
+def _looks_like_markdown(content: str) -> bool:
+    if not content:
+        return False
+    first_line = content.lstrip().split("\n", 1)[0]
+    if _MARKDOWN_LEADING_RE.match(first_line):
+        return True
+    if _MARKDOWN_INLINE_RE.search(content):
+        return True
+    if "\n" in content:  # multi-line prose renders better as markdown
+        return True
+    return False
+
+
+def _dingtalk_build_msg_param(
+    content: str,
+    *,
+    title: str = "Hermes",
+    msg_type: Optional[str] = None,
+) -> tuple[str, str]:
+    """Return (msgKey, JSON-encoded msgParam).
+
+    ``msg_type`` overrides auto-detection:
+      - "text"      → sampleText
+      - "markdown"  → sampleMarkdown
+      - "image"     → sampleImageMsg (content = mediaId or photoURL)
+      - "file"      → sampleFile (content = mediaId)
+      - "voice"     → sampleAudio (content = mediaId; duration=0 per reference)
+      - "video"     → sampleVideo (content = mediaId)
+    If None, chooses sampleMarkdown vs sampleText via
+    ``_looks_like_markdown``.  Matches the reference's ``buildMsgPayload``
+    (messaging.ts:150+).
+    """
+    truncated = content[:MAX_MESSAGE_LENGTH]
+
+    if msg_type == "image":
+        # sampleImageMsg.photoURL accepts the raw media_id with the leading
+        # ``@`` preserved — DingTalk's server-side resolves this to the
+        # tenant-internal image store.  Reference (messaging.ts:714-719 +
+        # messaging.ts:188-192): `photoURL: uploadResult.mediaId` with the
+        # inline comment "使用原始 mediaId（带 @）".
+        #
+        # Earlier iterations passed `https://down.dingtalk.com/media/<clean>`
+        # here.  The API accepted it, but DingTalk clients rendered a blank
+        # (white) image because the CDN URL requires a tenant-scoped auth
+        # handshake that the client doesn't perform during `sampleImageMsg`
+        # rendering.  Only keep the URL passthrough for already-public http(s)
+        # URLs the caller provides directly.
+        if truncated.startswith(("http://", "https://")):
+            photo_url = truncated
+        else:
+            photo_url = truncated if truncated.startswith("@") else f"@{truncated}"
+        return "sampleImageMsg", json.dumps(
+            {"photoURL": photo_url}, ensure_ascii=False,
+        )
+    if msg_type == "file":
+        # sampleFile / sampleAudio / sampleVideo take the raw media_id with
+        # leading ``@`` preserved (reference: media.ts:680+ & :876).
+        media_id = truncated if truncated.startswith("@") else f"@{truncated}"
+        return "sampleFile", json.dumps(
+            {"mediaId": media_id, "fileName": title, "fileType": "file"},
+            ensure_ascii=False,
+        )
+    if msg_type == "voice":
+        media_id = truncated if truncated.startswith("@") else f"@{truncated}"
+        return "sampleAudio", json.dumps(
+            {"mediaId": media_id, "duration": "0"}, ensure_ascii=False,
+        )
+    if msg_type == "video":
+        media_id = truncated if truncated.startswith("@") else f"@{truncated}"
+        return "sampleVideo", json.dumps(
+            {"videoMediaId": media_id, "videoType": "mp4",
+             "picMediaId": "", "duration": "0"},
+            ensure_ascii=False,
+        )
+    if msg_type == "text":
+        return "sampleText", json.dumps(
+            {"content": truncated}, ensure_ascii=False,
+        )
+    if msg_type == "markdown" or _looks_like_markdown(truncated):
+        return "sampleMarkdown", json.dumps(
+            {"title": title, "text": truncated}, ensure_ascii=False,
+        )
+    return "sampleText", json.dumps(
+        {"content": truncated}, ensure_ascii=False,
+    )
+
+
+async def _dingtalk_post_one(
+    *,
+    token: str,
+    robot_code: str,
+    bucket: str,
+    target_id: str,
+    msg_key: str,
+    msg_param: str,
+) -> Dict[str, Any]:
+    """POST a single already-built message to the correct Robot OpenAPI endpoint."""
+    if bucket == "group":
+        url = _DINGTALK_GROUP_SEND_URL
+        payload = {
+            "robotCode": robot_code,
+            "openConversationId": target_id,
+            "msgKey": msg_key,
+            "msgParam": msg_param,
+        }
+    else:
+        url = _DINGTALK_OTO_BATCH_SEND_URL
+        payload = {
+            "robotCode": robot_code,
+            "userIds": [target_id],
+            "msgKey": msg_key,
+            "msgParam": msg_param,
+        }
+
+    headers = {
+        "x-acs-dingtalk-access-token": token,
+        "Content-Type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+    except Exception as e:
+        return {"error": f"DingTalk OpenAPI request failed: {e}"}
+
+    if resp.status_code >= 300:
+        return {
+            "error": f"DingTalk OpenAPI HTTP {resp.status_code}: {resp.text[:300]}"
+        }
+
+    try:
+        body = resp.json()
+    except Exception:
+        body = {}
+    # Robot OpenAPI returns ``processQueryKey`` on success (reference:
+    # openclaw-connector messaging.ts:254,331,999).  Fallback to requestId.
+    request_id = body.get("processQueryKey") or body.get("requestId") or ""
+    return {"success": True, "request_id": request_id}
+
+
+async def dingtalk_send_proactive(
+    *,
+    client_id: str,
+    client_secret: str,
+    robot_code: str,
+    chat_id: str,
+    content: str,
+    media_files: Optional[List[tuple[str, bool]]] = None,
+    title: str = "Hermes",
+) -> Dict[str, Any]:
+    """Send a message via DingTalk Robot OpenAPI without Stream Mode.
+
+    Proactive-send counterpart to ``DingTalkAdapter.send()``'s
+    session_webhook path.  Authenticates with AppKey/Secret, routes by
+    ``chat_id`` shape (group / oto / lwcp), and optionally uploads+sends
+    media attachments as additional messages.
+
+    ``media_files`` is a list of ``(local_path, is_voice_hint)`` tuples.
+    Each file gets uploaded to /media/upload, then sent as a dedicated
+    message (sampleImageMsg / sampleAudio / sampleVideo / sampleFile).
+    Text is sent first (if non-empty), then each media in order.  Mirrors
+    Feishu's approach of emitting separate messages per attachment.
+
+    ``title`` is used for sampleMarkdown headings when content auto-upgrades.
+
+    Returns ``{"success": True, "request_id": ..., "route": ...}`` on success
+    of the primary (text or first) message.  ``media_results`` lists each
+    media attempt with its outcome.
+    """
+    if not HTTPX_AVAILABLE:
+        return {"error": "httpx not installed"}
+    if not client_id or not client_secret:
+        return {"error": "DingTalk proactive send requires client_id + client_secret"}
+    if not robot_code:
+        return {"error": "DingTalk proactive send requires robot_code (defaults to client_id)"}
+    if not chat_id:
+        return {"error": "DingTalk proactive send requires chat_id"}
+
+    # Classify FIRST so LWCP fast-fails with zero network roundtrip.
+    bucket, target_id = _dingtalk_classify_chat_id(chat_id)
+    if bucket == "lwcp":
+        return {
+            "error": (
+                "DingTalk chat_id is LWCP-encoded sender_id (%s…): cannot be routed "
+                "directly by Robot OpenAPI. Grant the app 'qyapi_get_department_list' "
+                "+ 'qyapi_get_department_member' permissions at open-dev.dingtalk.com "
+                "and resolve to plain staffId before calling proactive send."
+            ) % target_id[:16]
+        }
+
+    try:
+        token = await _dingtalk_fetch_access_token(client_id, client_secret)
+    except Exception as e:
+        return {"error": f"DingTalk accessToken fetch failed: {e}"}
+
+    results: List[Dict[str, Any]] = []
+    primary_request_id = ""
+
+    # 1. Text first (if non-empty).  Smart markdown detection applied here.
+    if content and content.strip():
+        msg_key, msg_param = _dingtalk_build_msg_param(content, title=title)
+        text_result = await _dingtalk_post_one(
+            token=token, robot_code=robot_code, bucket=bucket,
+            target_id=target_id, msg_key=msg_key, msg_param=msg_param,
+        )
+        if text_result.get("error"):
+            return text_result
+        primary_request_id = text_result.get("request_id", "")
+
+    # 2. Media (one message per file).  Non-fatal per file — we collect
+    # per-file results and let the caller decide what to surface.
+    if media_files:
+        oapi_token = await _dingtalk_fetch_oapi_token(client_id, client_secret)
+        if not oapi_token:
+            results.append({
+                "error": (
+                    "Could not obtain OAPI token for /media/upload — verify the "
+                    "app has ServerAPI permissions (qyapi_media) and retry."
+                ),
+            })
+            # Keep the text result if we had one.
+            if primary_request_id:
+                return {
+                    "success": True,
+                    "request_id": primary_request_id,
+                    "chat_id": target_id,
+                    "route": bucket,
+                    "media_results": results,
+                }
+            return results[-1]
+
+        for raw_path, is_voice_hint in media_files:
+            media_kind = (
+                "voice" if is_voice_hint and _classify_media_kind(raw_path) in ("voice", "file")
+                else _classify_media_kind(raw_path)
+            )
+            media_id = await _dingtalk_upload_media(
+                oapi_token=oapi_token,
+                file_path=raw_path,
+                media_kind=media_kind,
+            )
+            if not media_id:
+                results.append({
+                    "error": f"upload failed for {os.path.basename(raw_path)}",
+                    "path": raw_path,
+                })
+                continue
+            m_msg_key, m_msg_param = _dingtalk_build_msg_param(
+                media_id,
+                msg_type=media_kind,
+                title=os.path.basename(raw_path),
+            )
+            m_result = await _dingtalk_post_one(
+                token=token, robot_code=robot_code, bucket=bucket,
+                target_id=target_id, msg_key=m_msg_key, msg_param=m_msg_param,
+            )
+            m_result["kind"] = media_kind
+            m_result["path"] = raw_path
+            results.append(m_result)
+            if not primary_request_id and m_result.get("success"):
+                primary_request_id = m_result.get("request_id", "")
+
+    if not primary_request_id and not content.strip():
+        # Nothing delivered (empty text, all media failed).
+        return {
+            "error": "Nothing delivered: empty text and all media uploads failed",
+            "media_results": results,
+        }
+
+    return {
+        "success": True,
+        "request_id": primary_request_id,
+        "chat_id": target_id,
+        "route": bucket,
+        **({"media_results": results} if results else {}),
+    }
 
 
 def check_dingtalk_requirements() -> bool:
@@ -202,9 +840,28 @@ class DingTalkAdapter(BasePlatformAdapter):
         # auto-close them as siblings — otherwise tool-progress cards get
         # stuck in streaming state forever.
         self._streaming_cards: Dict[str, Dict[str, str]] = {}
+        # Per-card last-edit timestamp (ms) — used to throttle non-finalize
+        # edit_message() calls so DingTalk's concurrent-update 403 doesn't
+        # fire.  Finalize edits bypass the check.  Cleared on finalize.
+        self._card_last_edit_ms: Dict[str, int] = {}
+        # Per-chat error-send cooldown (chat_id -> last error send ts ms)
+        # so a burst of failures doesn't spam the user.
+        self._error_last_sent_ms: Dict[str, int] = {}
         # Track fire-and-forget emoji/reaction coroutines so Python's GC
         # doesn't drop them mid-flight, and we can cancel them on disconnect.
         self._bg_tasks: Set[asyncio.Task] = set()
+
+        # Per-session inbound message queue (promise-chain pattern ported
+        # from the reference connector, core/message-handler.ts:86-105).
+        # queueKey is the chat_id (conversation_id or sender_id).  Each
+        # new inbound message chains a ``.then()`` onto the previous
+        # task so same-session messages are processed in arrival order,
+        # avoiding parallel agent runs that race on the same context.
+        self._session_queues: Dict[str, asyncio.Task] = {}
+        self._session_last_activity: Dict[str, float] = {}
+        # Periodic sweep of stale queue entries (>5 min idle) so long-
+        # idle chats don't keep references to old Tasks forever.
+        self._session_queue_sweeper: Optional[asyncio.Task] = None
 
     # -- Connection lifecycle -----------------------------------------------
 
@@ -229,6 +886,8 @@ class DingTalkAdapter(BasePlatformAdapter):
 
         try:
             self._http_client = httpx.AsyncClient(timeout=30.0)
+
+            _install_dingtalk_websockets_proxy()
 
             credential = dingtalk_stream.Credential(
                 self._client_id, self._client_secret
@@ -263,6 +922,11 @@ class DingTalkAdapter(BasePlatformAdapter):
             )
 
             self._stream_task = asyncio.create_task(self._run_stream())
+            # Start the periodic sweeper for stale inbound-queue entries.
+            # Mirrors core/message-handler.ts:105 (setInterval 60s).
+            self._session_queue_sweeper = asyncio.create_task(
+                self._sweep_session_queues()
+            )
             self._mark_connected()
             logger.info("[%s] Connected via Stream Mode", self.name)
             return True
@@ -323,6 +987,27 @@ class DingTalkAdapter(BasePlatformAdapter):
                 logger.debug("[%s] stream task did not exit cleanly during disconnect", self.name)
             self._stream_task = None
 
+        # Stop the session-queue sweeper.
+        if self._session_queue_sweeper:
+            self._session_queue_sweeper.cancel()
+            try:
+                await self._session_queue_sweeper
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._session_queue_sweeper = None
+
+        # Cancel any still-pending inbound-queue tasks so disconnect
+        # doesn't hang waiting on half-handled messages.
+        if self._session_queues:
+            for task in list(self._session_queues.values()):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *self._session_queues.values(), return_exceptions=True,
+            )
+            self._session_queues.clear()
+        self._session_last_activity.clear()
+
         # Cancel any in-flight background tasks (emoji reactions, etc.)
         if self._bg_tasks:
             for task in list(self._bg_tasks):
@@ -338,6 +1023,8 @@ class DingTalkAdapter(BasePlatformAdapter):
         self._session_webhooks.clear()
         self._message_contexts.clear()
         self._streaming_cards.clear()
+        self._card_last_edit_ms.clear()
+        self._error_last_sent_ms.clear()
         self._done_emoji_fired.clear()
         self._dedup.clear()
         logger.info("[%s] Disconnected", self.name)
@@ -459,6 +1146,117 @@ class DingTalkAdapter(BasePlatformAdapter):
         task = asyncio.create_task(coro)
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
+
+    # -- Inbound serialization queue ---------------------------------------
+
+    def _inbound_queue_key(self, chatbot_msg: "ChatbotMessage") -> str:
+        """Build the queueKey for same-session inbound serialization.
+
+        Mirrors core/message-handler.ts:1601-1649 but simplified: hermes
+        has one agent per adapter, so we key on chat_id alone
+        (conversation_id for groups, sender_id for DMs).  Parallel
+        different-chat messages still fan out — the queue only serializes
+        same-chat arrivals.
+        """
+        conv_id = getattr(chatbot_msg, "conversation_id", "") or ""
+        sender_id = getattr(chatbot_msg, "sender_id", "") or ""
+        return conv_id or sender_id
+
+    async def _send_busy_ack(self, chatbot_msg: "ChatbotMessage") -> None:
+        """Send a text ACK when a new message lands on a busy queue.
+
+        Reference: core/message-handler.ts:1662-1689 creates an AI Card
+        with ACK text and hands it to the dispatcher for later reuse.
+        hermes does NOT thread a pre-created card into ``send()`` (that
+        refactor is out of scope for this port), so we fall back to a
+        plain text webhook reply — users still see immediate feedback
+        that the bot received their message, just as a separate bubble
+        instead of an in-place card update.
+        """
+        if not self._http_client:
+            return
+        webhook = getattr(chatbot_msg, "session_webhook", "") or ""
+        if not webhook or not _DINGTALK_WEBHOOK_RE.match(webhook):
+            return
+        phrase = random.choice(_QUEUE_BUSY_ACK_PHRASES)
+        try:
+            await self._http_client.post(
+                webhook,
+                json={"msgtype": "text", "text": {"content": phrase}},
+                timeout=5.0,
+            )
+        except Exception as e:
+            logger.debug("[%s] busy ACK send failed: %s", self.name, e)
+
+    async def _enqueue_inbound(self, chatbot_msg: "ChatbotMessage") -> None:
+        """Chain inbound message processing onto the per-chat queue tail.
+
+        Mirrors core/message-handler.ts:1651-1719.  Same-chat messages are
+        processed strictly in order; different chats run in parallel.
+        When a new message lands while the queue is already working on a
+        previous one, a busy-ACK is sent fire-and-forget so the user sees
+        immediate feedback that we noticed their message.
+        """
+        queue_key = self._inbound_queue_key(chatbot_msg)
+        if not queue_key:
+            await self._on_message(chatbot_msg)
+            return
+
+        self._session_last_activity[queue_key] = time.monotonic()
+        prev_task = self._session_queues.get(queue_key)
+        is_busy = prev_task is not None and not prev_task.done()
+
+        if is_busy:
+            self._spawn_bg(self._send_busy_ack(chatbot_msg))
+
+        async def _chained() -> None:
+            if prev_task is not None:
+                try:
+                    await prev_task
+                except Exception:
+                    # Prior task's failure is its own problem; don't
+                    # block the whole queue.
+                    pass
+            await self._on_message(chatbot_msg)
+
+        task = asyncio.create_task(_chained())
+        self._session_queues[queue_key] = task
+
+        def _cleanup(t: asyncio.Task) -> None:
+            # Only clear the map if we're still the tail — a newer
+            # enqueue may have already replaced us.
+            if self._session_queues.get(queue_key) is t:
+                self._session_queues.pop(queue_key, None)
+
+        task.add_done_callback(_cleanup)
+
+    async def _sweep_session_queues(self) -> None:
+        """Periodic sweep of stale queueKey entries.
+
+        Runs every 60s.  Entries idle for more than ``_INBOUND_QUEUE_TTL_SEC``
+        are dropped from the activity map; entries whose Task already
+        completed are also dropped from ``_session_queues`` (defensive —
+        done_callback normally handles this, but an entry may survive if
+        the callback raced with sweep).  Mirrors
+        core/message-handler.ts:94-105.
+        """
+        try:
+            while self._running:
+                await asyncio.sleep(60)
+                now = time.monotonic()
+                stale = [
+                    k for k, ts in self._session_last_activity.items()
+                    if now - ts > _INBOUND_QUEUE_TTL_SEC
+                ]
+                for k in stale:
+                    self._session_last_activity.pop(k, None)
+                    task = self._session_queues.get(k)
+                    if task is not None and task.done():
+                        self._session_queues.pop(k, None)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.debug("[%s] session-queue sweep error: %s", self.name, e)
 
     # -- AI Card lifecycle helpers ------------------------------------------
 
@@ -640,6 +1438,106 @@ class DingTalkAdapter(BasePlatformAdapter):
         await self.handle_message(event)
 
     @staticmethod
+    def _extract_quoted_msg_text(container: Any, max_depth: int = 3) -> Optional[str]:
+        """Extract a ``[引用] <body>`` string from a DingTalk reply container.
+
+        When a user long-presses → quotes → replies in the DingTalk client,
+        the inbound payload carries ``isReplyMsg=True`` + ``repliedMsg={...}``
+        alongside the user's new text. The DingTalk Robot OpenAPI does not
+        surface this through a typed SDK field, so the reference connector
+        (dingtalk-openclaw-connector, ``core/message-handler.ts:163-240``)
+        walks the raw dict. We mirror that logic here to preserve the
+        quoted-context signal for the agent.
+
+        ``max_depth`` bounds nested-quote recursion (matches openclaw's 3).
+        Returns ``None`` when no quote is present or the body is empty.
+        """
+        if max_depth <= 0 or not container:
+            return None
+        if not container.get("isReplyMsg"):
+            return None
+
+        replied = container.get("repliedMsg")
+        if not replied:
+            return None
+
+        msg_type = replied.get("msgType") or "text"
+
+        raw_content = replied.get("content")
+        if isinstance(raw_content, dict):
+            content_obj = raw_content
+        elif isinstance(raw_content, str):
+            try:
+                parsed = json.loads(raw_content)
+                content_obj = parsed if isinstance(parsed, dict) else {}
+            except (ValueError, TypeError):
+                content_obj = {}
+        else:
+            content_obj = {}
+
+        body_text = ""
+        if msg_type == "text":
+            body_text = (content_obj.get("text") or replied.get("text") or "").strip()
+            if content_obj.get("isReplyMsg"):
+                nested = DingTalkAdapter._extract_quoted_msg_text(content_obj, max_depth - 1)
+                if nested:
+                    body_text = f"{body_text}\n{nested}" if body_text else nested
+        elif msg_type == "richText":
+            rich_list = content_obj.get("richText") or []
+            parts = [
+                item.get("text", "")
+                for item in rich_list
+                if isinstance(item, dict)
+                and item.get("text")
+                and item.get("msgType") != "skill"
+                and not item.get("skillData")
+            ]
+            body_text = "".join(parts)
+        elif msg_type == "picture":
+            body_text = "[图片]"
+        elif msg_type == "video":
+            body_text = "[视频]"
+        elif msg_type == "audio":
+            body_text = content_obj.get("recognition") or "[语音消息]"
+        elif msg_type == "file":
+            file_name = content_obj.get("fileName") or "unknown"
+            body_text = f"[文件: {file_name}]"
+        elif msg_type == "markdown":
+            body_text = (content_obj.get("text") or "").strip() or "[markdown消息]"
+        elif msg_type == "interactiveCard":
+            # Forward-compatible extraction.  Today DingTalk does NOT populate
+            # `content` for quoted interactiveCards — only 4 metadata fields
+            # (msgId/senderId/msgType/createdAt) are delivered.  We are
+            # pushing the DingTalk IM team to populate `content.text` /
+            # `content.markdown` / `content.title` on the server side; once
+            # they ship, hermes picks it up automatically without code change.
+            card_text = ""
+            for key in ("text", "markdown", "title", "summary"):
+                candidate = content_obj.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    card_text = candidate.strip()
+                    break
+            if card_text:
+                body_text = card_text
+            else:
+                card_url = (
+                    content_obj.get("biz_custom_action_url")
+                    or replied.get("biz_custom_action_url")
+                    or ""
+                )
+                body_text = (
+                    f"收到交互式卡片链接：{card_url}"
+                    if card_url
+                    else "[interactiveCard消息]"
+                )
+        else:
+            body_text = f"[{msg_type}消息]"
+
+        if not body_text:
+            return None
+        return f"[引用] {body_text}"
+
+    @staticmethod
     def _extract_text(message: "ChatbotMessage") -> str:
         """Extract plain text from a DingTalk chatbot message.
 
@@ -650,16 +1548,39 @@ class DingTalkAdapter(BasePlatformAdapter):
             back to ``str(text)`` without extracting ``.content`` first.
           * rich text moved from ``message.rich_text`` (list) to
             ``message.rich_text_content.rich_text_list`` (list of dicts).
+
+        When the user quoted an earlier message (``isReplyMsg=True``), the
+        quoted body is appended as ``[引用] <body>`` so the agent sees the
+        conversational context, matching dingtalk-openclaw-connector.
         """
         text = getattr(message, "text", None) or ""
 
-        # Handle TextContent object (SDK style)
+        # Handle TextContent object (SDK style). TextContent.from_dict routes
+        # unknown JSON fields (isReplyMsg, repliedMsg) into ``.extensions``.
+        quote_container: Optional[Dict[str, Any]] = None
         if hasattr(text, "content"):
             content = (text.content or "").strip()
+            extensions = getattr(text, "extensions", None)
+            if isinstance(extensions, dict) and extensions.get("isReplyMsg"):
+                quote_container = extensions
         elif isinstance(text, dict):
             content = text.get("content", "").strip()
+            if text.get("isReplyMsg"):
+                quote_container = text
         else:
             content = str(text).strip()
+
+        if quote_container:
+            try:
+                logger.info(
+                    "dingtalk quote payload: %s",
+                    json.dumps(quote_container, ensure_ascii=False, default=str),
+                )
+            except Exception:
+                logger.info("dingtalk quote payload (repr): %r", quote_container)
+            quoted = DingTalkAdapter._extract_quoted_msg_text(quote_container, max_depth=3)
+            if quoted:
+                content = f"{content}\n{quoted}" if content else quoted
 
         if not content:
             rich_text = getattr(message, "rich_text_content", None) or getattr(
@@ -755,7 +1676,18 @@ class DingTalkAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send a markdown reply via DingTalk session webhook."""
+        """Send a markdown reply via DingTalk session webhook.
+
+        ``reply_to`` is accepted for cross-platform BasePlatformAdapter
+        signature parity, but DingTalk Robot OpenAPI and session_webhook
+        payloads have no "reply to message X" field.  The reference
+        connector (dingtalk-openclaw-connector) also plumbs ``replyToId``
+        through its signatures but never puts it in an outbound body —
+        see messaging.ts:567-569.  We use it only as the "final reply"
+        vs "intermediate tool progress" routing signal for AI Card
+        lifecycle (see ``is_final_reply`` below).  Threading is likewise
+        unsupported (see channel.ts:97 ``threads: false``).
+        """
         metadata = metadata or {}
         logger.debug(
             "[%s] send() chat_id=%s card_enabled=%s",
@@ -768,16 +1700,32 @@ class DingTalkAdapter(BasePlatformAdapter):
         session_webhook = metadata.get("session_webhook")
         if not session_webhook:
             webhook_info = self._get_valid_webhook(chat_id)
-            if not webhook_info:
-                logger.warning(
-                    "[%s] No valid session_webhook for chat_id=%s",
+            if webhook_info:
+                session_webhook, _ = webhook_info
+            else:
+                # No reply webhook for this chat — this is a proactive send
+                # (no preceding inbound message in cache).  Fall back to
+                # Robot OpenAPI using AppKey/Secret, same pattern Feishu uses
+                # for proactive ``im.v1.message.create`` calls.
+                logger.debug(
+                    "[%s] No session_webhook for chat_id=%s; routing via Robot OpenAPI",
                     self.name, chat_id,
                 )
-                return SendResult(
-                    success=False,
-                    error="No valid session_webhook available. Reply must follow an incoming message.",
+                result = await dingtalk_send_proactive(
+                    client_id=self._client_id,
+                    client_secret=self._client_secret,
+                    robot_code=self._robot_code,
+                    chat_id=chat_id,
+                    content=content,
                 )
-            session_webhook, _ = webhook_info
+                if result.get("success"):
+                    return SendResult(
+                        success=True,
+                        message_id=result.get("request_id") or uuid.uuid4().hex[:12],
+                    )
+                return SendResult(
+                    success=False, error=result.get("error", "unknown"),
+                )
 
         if not self._http_client:
             return SendResult(success=False, error="HTTP client not initialized")
@@ -830,6 +1778,18 @@ class DingTalkAdapter(BasePlatformAdapter):
             "msgtype": "markdown",
             "markdown": {"title": "Hermes", "text": normalized},
         }
+
+        # Optional @mention: metadata may carry ``at_user_ids`` (list of
+        # staff_ids) or ``at_all`` (bool) which DingTalk's custom-robot
+        # webhook accepts under the ``at`` key.  Mirrors reference
+        # messaging/send.ts:54-59.
+        at_user_ids = metadata.get("at_user_ids") if metadata else None
+        at_all = bool(metadata.get("at_all")) if metadata else False
+        if at_user_ids or at_all:
+            payload["at"] = {
+                "atUserIds": list(at_user_ids) if at_user_ids else [],
+                "isAtAll": at_all,
+            }
 
         try:
             resp = await self._http_client.post(
@@ -1020,6 +1980,25 @@ class DingTalkAdapter(BasePlatformAdapter):
         """
         if not message_id:
             return SendResult(success=False, error="message_id required")
+
+        # Throttle non-finalize edits per out_track_id.  DingTalk's
+        # streaming_update endpoint 403s if two edits to the same card
+        # land within ~500ms.  Finalize edits bypass — dropping them
+        # would leave the card stuck in streaming state forever.
+        # Optimistic update: stamp lastUpdate BEFORE the network call so
+        # concurrent edits don't both pass the window check during
+        # the await (mirrors reply-dispatcher.ts:607 pattern).
+        now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+        if not finalize:
+            last_ms = self._card_last_edit_ms.get(message_id, 0)
+            if now_ms - last_ms < _CARD_EDIT_THROTTLE_MS:
+                logger.debug(
+                    "[%s] edit_message throttled (%dms since last) for %s",
+                    self.name, now_ms - last_ms, message_id,
+                )
+                return SendResult(success=True, message_id=message_id)
+        self._card_last_edit_ms[message_id] = now_ms
+
         token = await self._get_access_token()
         if not token:
             return SendResult(success=False, error="No access token")
@@ -1035,6 +2014,8 @@ class DingTalkAdapter(BasePlatformAdapter):
                 self._streaming_cards.get(chat_id, {}).pop(message_id, None)
                 if not self._streaming_cards.get(chat_id):
                     self._streaming_cards.pop(chat_id, None)
+                # Card is closed; throttle ts is no longer useful.
+                self._card_last_edit_ms.pop(message_id, None)
                 logger.debug(
                     "[%s] AI Card finalized (edit): %s",
                     self.name, message_id,
@@ -1057,7 +2038,15 @@ class DingTalkAdapter(BasePlatformAdapter):
         content: str,
         finalize: bool = False,
     ) -> None:
-        """Stream content to an existing AI Card."""
+        """Stream content to an existing AI Card.
+
+        Per-card 800ms throttle happens at the ``edit_message`` layer; this
+        function additionally goes through the **global** token bucket so
+        that many parallel chats can't collectively overrun the tenant-wide
+        DingTalk card-API QPS cap (~40/s).  On an upstream limit response,
+        ``trigger_backoff`` pauses every acquirer for 2s before spending
+        the next token — same pattern as messaging/card.ts:93.
+        """
         stream_request = dingtalk_card_models.StreamingUpdateRequest(
             out_track_id=out_track_id,
             guid=str(uuid.uuid4()),
@@ -1073,9 +2062,24 @@ class DingTalkAdapter(BasePlatformAdapter):
         )
 
         runtime = tea_util_models.RuntimeOptions()
-        await self._card_sdk.streaming_update_with_options_async(
-            stream_request, stream_headers, runtime
-        )
+        await _CARD_BUCKET.acquire()
+        try:
+            await self._card_sdk.streaming_update_with_options_async(
+                stream_request, stream_headers, runtime
+            )
+        except Exception as e:
+            # Detect DingTalk's 403 "QpsLimit" style responses.  The Tea SDK
+            # raises with the error code embedded in the message — string
+            # match is intentional (reference messaging/card.ts:107-125
+            # does the same).
+            err_msg = str(e)
+            if "QpsLimit" in err_msg or "403" in err_msg or "qps" in err_msg.lower():
+                logger.warning(
+                    "[%s] Card QPS limit hit, backing off %dms: %s",
+                    self.name, _CARD_API_QPS_BACKOFF_MS, err_msg[:160],
+                )
+                _CARD_BUCKET.trigger_backoff()
+            raise
 
     async def _get_access_token(self) -> Optional[str]:
         """Get access token using SDK's cached token."""
@@ -1353,9 +2357,14 @@ class _IncomingHandler(
         return AckMessage.STATUS_OK, "OK"
 
     async def _safe_on_message(self, chatbot_msg: "ChatbotMessage") -> None:
-        """Wrapper that catches exceptions from _on_message."""
+        """Wrapper that catches exceptions from _on_message.
+
+        Dispatches through ``_enqueue_inbound`` so same-chat messages are
+        serialized (with a busy-ACK on the tail), mirroring the reference
+        connector's per-session queue at core/message-handler.ts:1597-1720.
+        """
         try:
-            await self._adapter._on_message(chatbot_msg)
+            await self._adapter._enqueue_inbound(chatbot_msg)
         except Exception:
             logger.exception(
                 "[%s] Error processing incoming message", self._adapter.name
