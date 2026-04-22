@@ -29,6 +29,7 @@ Configuration in config.yaml:
 import asyncio
 import json
 import logging
+import mimetypes
 import os
 import random
 import re
@@ -142,6 +143,11 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    cache_audio_from_bytes,
+    cache_document_from_bytes,
+    cache_image_from_bytes,
+    cache_video_from_bytes,
+    get_document_cache_dir,
 )
 
 logger = logging.getLogger(__name__)
@@ -477,6 +483,152 @@ async def _download_file_to_temp(
         return tmp_path
     except Exception as exc:
         logger.warning("Failed to download file %s: %s", file_name, exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Unified media download layer
+#
+# DingTalk's signed OSS URLs are not universally accessible -- vision / STT /
+# tool code running in a different network context routinely fails with
+# "Invalid image source" / HTTP 403 against them.  The reference connector
+# sidesteps this by downloading every inbound media file inside the gateway
+# process (same IP / egress path as the DingTalk SDK) and passing local file
+# paths downstream.  We mirror that pattern for ALL media kinds
+# (image / audio / video / generic file), not only images, so the agent can
+# consistently use its filesystem / vision / transcription tools.
+# ---------------------------------------------------------------------------
+
+# Default fallback extensions per media kind when the URL and response
+# headers give no usable hint.
+_DEFAULT_MEDIA_EXT: Dict[str, str] = {
+    "image": ".jpg",
+    "audio": ".amr",
+    "video": ".mp4",
+    "file": ".bin",
+}
+
+# Default MIME per kind when the server sends no content-type.
+_DEFAULT_MEDIA_MIME: Dict[str, str] = {
+    "image": "image/jpeg",
+    "audio": "audio/amr",
+    "video": "video/mp4",
+    "file": "application/octet-stream",
+}
+
+
+def _normalize_media_kind(media_type: str, fallback: str = "file") -> str:
+    """Coerce ``media_types`` entries to one of image/audio/video/file."""
+    if not media_type:
+        return fallback
+    mt = media_type.lower()
+    if mt in ("image", "audio", "video", "file"):
+        return mt
+    if mt.startswith("image/"):
+        return "image"
+    if mt.startswith("audio/"):
+        return "audio"
+    if mt.startswith("video/"):
+        return "video"
+    return fallback
+
+
+def _infer_media_ext(
+    *, url: str, content_type: Optional[str], hint_filename: Optional[str], kind: str,
+) -> str:
+    """Pick a sane file extension for a downloaded media payload.
+
+    Priority: explicit filename -> URL path -> server content-type -> kind default.
+    """
+    if hint_filename:
+        ext = os.path.splitext(hint_filename)[1].lower()
+        if ext:
+            return ext
+
+    url_path = url.split("?", 1)[0].split("#", 1)[0]
+    url_ext = os.path.splitext(url_path)[1].lower()
+    if url_ext and len(url_ext) <= 6:
+        return url_ext
+
+    if content_type:
+        guessed = mimetypes.guess_extension(content_type.split(";", 1)[0].strip())
+        if guessed:
+            return guessed
+
+    return _DEFAULT_MEDIA_EXT.get(kind, ".bin")
+
+
+def _resolve_media_mime(
+    *, ext: str, content_type: Optional[str], kind: str,
+) -> str:
+    """Pick the best MIME for downstream media_types.
+
+    Prefer the server's content-type when it matches the expected kind,
+    otherwise guess from the extension, otherwise fall back to the default.
+    """
+    ct = (content_type or "").split(";", 1)[0].strip().lower()
+    if kind == "image" and ct.startswith("image/"):
+        return ct
+    if kind == "audio" and ct.startswith("audio/"):
+        return ct
+    if kind == "video" and ct.startswith("video/"):
+        return ct
+    if kind == "file" and ct:
+        return ct
+
+    if ext:
+        guessed, _ = mimetypes.guess_type("x" + ext)
+        if guessed:
+            return guessed
+
+    return _DEFAULT_MEDIA_MIME.get(kind, "application/octet-stream")
+
+
+async def _fetch_media_bytes(
+    url: str, *, timeout: float = 60.0,
+) -> Optional[Tuple[bytes, Optional[str]]]:
+    """GET ``url`` and return ``(bytes, content_type)``. Returns None on failure."""
+    if not HTTPX_AVAILABLE:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+        return resp.content, resp.headers.get("content-type")
+    except Exception as exc:
+        logger.warning("Failed to fetch media %s: %s", url[:80], exc)
+        return None
+
+
+def _cache_media_bytes(
+    data: bytes, *, kind: str, ext: str, filename: Optional[str] = None,
+) -> Optional[str]:
+    """Persist downloaded media to the kind-appropriate cache and return the path.
+
+    - image / audio / video use their dedicated caches (opaque ``uuid``-prefixed
+      names) so downstream tools treat them like any other platform media.
+    - file persists into the document cache with the original filename preserved
+      so the agent can reference it meaningfully.
+    """
+    try:
+        if kind == "image":
+            return cache_image_from_bytes(data, ext)
+        if kind == "audio":
+            return cache_audio_from_bytes(data, ext)
+        if kind == "video":
+            return cache_video_from_bytes(data, ext)
+        # Generic file: fall back to document cache, preserving filename.
+        safe_name = filename or f"attachment{ext or '.bin'}"
+        return cache_document_from_bytes(data, safe_name)
+    except ValueError as exc:
+        # cache_image_from_bytes rejects non-image payloads (e.g. HTML error
+        # pages proxied through the OSS CDN).  Surface that as a warning so
+        # operators can see why the media was dropped, but don't crash the
+        # whole message path.
+        logger.warning("Refusing to cache %s media: %s", kind, exc)
+        return None
+    except Exception:
+        logger.warning("Failed to persist %s media into cache", kind, exc_info=True)
         return None
 
 
@@ -1631,23 +1783,26 @@ class DingTalkAdapter(BasePlatformAdapter):
         # ------------------------------------------------------------------
         if media_urls:
             try:
-                media_urls = await self._download_images_to_local(
+                media_urls, media_types = await self._download_media_to_local(
                     media_urls, media_types, message,
                 )
             except Exception:
                 logger.warning(
-                    "[%s] Image download to local failed (non-fatal), keeping URLs",
+                    "[%s] Media download to local failed (non-fatal), keeping URLs",
                     self.name, exc_info=True,
                 )
 
         # ------------------------------------------------------------------
-        # File content auto-parsing: download text-type files (.md, .txt,
-        # .json, .docx, .pdf, etc.) and inject their content into ``text``
-        # so the LLM can see the content immediately without needing tools.
+        # Standalone msgtype=file/audio/video messages carry their payload
+        # in ``extensions['content']`` and never make it into media_urls on
+        # their own.  Pull those into the cache too + extract ASR text /
+        # parse document content inline so the LLM can use them immediately.
         # Mirrors dingtalk-openclaw-connector core/message-handler.ts:1226-1328.
         # ------------------------------------------------------------------
         try:
-            file_parts = await self._extract_and_parse_file_attachments(message)
+            file_parts, downloaded_media = await self._extract_and_parse_file_attachments(
+                message,
+            )
             if file_parts:
                 file_text = "\n\n".join(file_parts)
                 text = f"{text}\n\n{file_text}" if text else file_text
@@ -1655,11 +1810,56 @@ class DingTalkAdapter(BasePlatformAdapter):
                     "[%s] Injected %d file content block(s) into message text",
                     self.name, len(file_parts),
                 )
+            if downloaded_media:
+                for path, mime in downloaded_media:
+                    media_urls.append(path)
+                    media_types.append(mime)
+                logger.info(
+                    "[%s] Added %d cached attachment(s) to media_urls",
+                    self.name, len(downloaded_media),
+                )
+                # _extract_media() only inspects image_content / rich_text,
+                # so for a standalone audio/video/file message msg_type
+                # stays TEXT and gateway/run.py skips the enrichment
+                # pipeline.  Promote it now that we've attached the path.
+                raw_msg_type = getattr(message, "message_type", "") or ""
+                if msg_type == MessageType.TEXT:
+                    if raw_msg_type == "audio":
+                        msg_type = MessageType.AUDIO
+                    elif raw_msg_type == "video":
+                        msg_type = MessageType.VIDEO
+                    elif raw_msg_type == "file":
+                        msg_type = MessageType.DOCUMENT
         except Exception:
             logger.warning(
                 "[%s] File content extraction failed (non-fatal), continuing",
                 self.name, exc_info=True,
             )
+
+        # ------------------------------------------------------------------
+        # Rich-text inline attachments were already cached by
+        # _download_media_to_local above.  For parseable documents among
+        # them, extract the plain text inline so the agent sees the content
+        # without having to call a tool.  Failures are silent -- the file
+        # path remains in media_urls as a fallback.
+        # ------------------------------------------------------------------
+        if media_urls:
+            try:
+                inline_parts = await self._inline_parse_document_media(
+                    media_urls, media_types,
+                )
+                if inline_parts:
+                    inline_text = "\n\n".join(inline_parts)
+                    text = f"{text}\n\n{inline_text}" if text else inline_text
+                    logger.info(
+                        "[%s] Inline-parsed %d document(s) from rich text",
+                        self.name, len(inline_parts),
+                    )
+            except Exception:
+                logger.warning(
+                    "[%s] Inline document parse failed (non-fatal), continuing",
+                    self.name, exc_info=True,
+                )
 
         if not text and not media_urls:
             logger.debug("[%s] Empty message, skipping", self.name)
@@ -1964,42 +2164,49 @@ class DingTalkAdapter(BasePlatformAdapter):
 
         return msg_type, media_urls, media_types
 
-    async def _download_images_to_local(
+    async def _download_media_to_local(
         self,
         media_urls: List[str],
         media_types: List[str],
         message: "ChatbotMessage",
-    ) -> List[str]:
-        """Download remote image URLs to local temp files.
+    ) -> Tuple[List[str], List[str]]:
+        """Download every inbound media entry to the local cache.
 
         DingTalk's ``_resolve_media_codes`` replaces download codes with signed
         OSS URLs.  These signed URLs are **not universally accessible** — the
         OSS signature may be bound to specific request headers, IP ranges, or
-        Referer, so the downstream ``vision_analyze_tool`` (which runs in a
-        different network context) consistently fails with "Invalid image
-        source" or HTTP 403.
+        Referer, so downstream tools (``vision_analyze_tool``,
+        ``voice_transcribe``, ``terminal``'s ``ls``/``cat``) running in a
+        different network context consistently fail with "Invalid image
+        source", HTTP 403, or simply "file not found".
 
         The reference connector (dingtalk-openclaw-connector) avoids this by
-        downloading images to local files first and passing ``file://`` paths.
-        We mirror that approach here: for each image in *media_urls*, download
-        via httpx (which runs in the same process as the DingTalk SDK and
-        therefore shares the same network/IP context) and replace the URL with
-        the local temp-file path.
+        downloading every attachment to a local file and passing the local
+        path to the runtime.  Previously we only did that for images; this
+        unified version now caches image / audio / video and generic-file
+        attachments alike.  Each path is written into the kind-appropriate
+        cache (image/audio/video/document cache dir) and the matching
+        ``media_types`` entry is normalised to the actual MIME type so
+        ``gateway/run.py`` can route the enrichment pipeline correctly.
 
-        Non-image entries and entries that fail to download are left unchanged.
+        Entries that fail to download are left unchanged; failures are
+        non-fatal (we keep the original URL / code so the agent can at least
+        reason about the message metadata).
+
+        Returns:
+            Tuple of ``(updated_urls, updated_mime_types)``.
         """
-        result = list(media_urls)  # shallow copy
+        result_urls = list(media_urls)
+        result_types = list(media_types)
         robot_code = getattr(message, "robot_code", None) or self._client_id
         token: Optional[str] = None  # lazy-fetched
 
         for i, url in enumerate(media_urls):
-            mtype = media_types[i] if i < len(media_types) else ""
-            if mtype != "image":
-                continue  # only process images
+            raw_type = media_types[i] if i < len(media_types) else ""
+            kind = _normalize_media_kind(raw_type, fallback="file")
 
             try:
                 download_url = url
-                # If URL is still a download code (not http), resolve it first
                 if not url.startswith("http"):
                     if token is None:
                         token = await self._get_access_token()
@@ -2008,100 +2215,163 @@ class DingTalkAdapter(BasePlatformAdapter):
                     )
                     if not download_url:
                         logger.warning(
-                            "[%s] Failed to resolve image download code, keeping original",
-                            self.name,
+                            "[%s] Failed to resolve %s download code, keeping original",
+                            self.name, kind,
                         )
                         continue
 
-                # Download to temp file
-                ext = ".png"  # safe default for images
-                # Try to detect from URL path (before query params)
-                url_path = download_url.split("?")[0]
-                for img_ext in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"):
-                    if url_path.lower().endswith(img_ext):
-                        ext = img_ext
-                        break
-
-                local_path = await _download_file_to_temp(
-                    download_url, f"image{ext}", timeout=30.0,
-                )
-                if local_path:
-                    result[i] = local_path
-                    logger.info(
-                        "[%s] Downloaded image to local: %s -> %s",
-                        self.name, url[:60], local_path,
-                    )
-                else:
+                fetched = await _fetch_media_bytes(download_url, timeout=60.0)
+                if not fetched:
                     logger.warning(
-                        "[%s] Image download failed, keeping original URL: %s",
-                        self.name, url[:80],
+                        "[%s] %s download failed, keeping original URL: %s",
+                        self.name, kind, url[:80],
                     )
+                    continue
+
+                data, content_type = fetched
+                ext = _infer_media_ext(
+                    url=download_url,
+                    content_type=content_type,
+                    hint_filename=None,
+                    kind=kind,
+                )
+                local_path = _cache_media_bytes(data, kind=kind, ext=ext)
+                if not local_path:
+                    continue
+
+                result_urls[i] = local_path
+                result_types[i] = _resolve_media_mime(
+                    ext=ext, content_type=content_type, kind=kind,
+                )
+                logger.info(
+                    "[%s] Cached inbound %s -> %s (mime=%s, %d bytes)",
+                    self.name, kind, local_path, result_types[i], len(data),
+                )
             except Exception as exc:
                 logger.warning(
-                    "[%s] Image download error (non-fatal): %s", self.name, exc,
+                    "[%s] %s download error (non-fatal): %s",
+                    self.name, kind, exc,
                 )
 
-        return result
+        return result_urls, result_types
+
+    async def _resolve_and_cache_media(
+        self,
+        dl_code_or_url: str,
+        *,
+        kind: str,
+        hint_filename: Optional[str],
+        message: "ChatbotMessage",
+    ) -> Tuple[Optional[str], str]:
+        """Resolve a DingTalk downloadCode (or signed URL) and persist locally.
+
+        Returns ``(local_path_or_None, mime)``.  ``mime`` is a best-effort
+        guess based on the server content-type, the URL path extension, and
+        the expected kind, so callers can set ``media_types`` to a value
+        that matches ``gateway/run.py``'s enrichment routing heuristics
+        (``image/…``, ``audio/…``, ``video/…``, ``application/…``).
+        """
+        robot_code = getattr(message, "robot_code", None) or self._client_id
+        default_mime = _DEFAULT_MEDIA_MIME.get(kind, "application/octet-stream")
+
+        download_url = dl_code_or_url
+        if not dl_code_or_url.startswith("http"):
+            token = await self._get_access_token()
+            download_url = await self._resolve_single_download_url(
+                dl_code_or_url, robot_code, token,
+            )
+            if not download_url:
+                return None, default_mime
+
+        fetched = await _fetch_media_bytes(download_url, timeout=60.0)
+        if not fetched:
+            return None, default_mime
+
+        data, content_type = fetched
+        ext = _infer_media_ext(
+            url=download_url,
+            content_type=content_type,
+            hint_filename=hint_filename,
+            kind=kind,
+        )
+        local = _cache_media_bytes(data, kind=kind, ext=ext, filename=hint_filename)
+        if not local:
+            return None, default_mime
+        mime = _resolve_media_mime(ext=ext, content_type=content_type, kind=kind)
+        return local, mime
 
     async def _extract_and_parse_file_attachments(
         self, message: "ChatbotMessage",
-    ) -> List[str]:
-        """Download and parse ALL rich-media attachments from the message.
+    ) -> Tuple[List[str], List[Tuple[str, str]]]:
+        """Download msgtype=audio/video/file standalone attachments.
 
-        Mirrors dingtalk-openclaw-connector core/message-handler.ts:350-598
-        (extractMessageContent) and L1226-1328 (file download + parse).
+        The dingtalk-stream SDK's ``ChatbotMessage.from_dict()`` only handles
+        ``text``, ``picture`` and ``richText``.  For ``file`` / ``audio`` /
+        ``video`` the raw ``content`` dict lives in
+        ``message.extensions['content']`` -- these attachments would otherwise
+        never make it to ``media_urls`` and the agent would have no way to
+        reach them via its tools.
 
-        Handles:
-          * msgtype='file'  → download + parse text-type files
-          * msgtype='audio' → extract recognition text + note file info
-          * msgtype='video' → note file info
-          * richText items   → download + parse files embedded in rich text
+        This method:
 
-        CRITICAL: The dingtalk-stream SDK's ChatbotMessage.from_dict() only
-        handles 'text', 'picture', 'richText'.  For 'file', 'audio', 'video'
-        the raw ``content`` dict lives in ``message.extensions['content']``.
+        * Persists the attachment bytes into the kind-appropriate cache
+          (audio cache / video cache / document cache) so the agent can
+          open / transcribe / analyse them with its filesystem + vision +
+          STT tools.
+        * For ``audio`` also injects the server-provided ASR recognition
+          text as a visible message part (DingTalk's own ASR is often good
+          enough that the agent doesn't need to re-transcribe).
+        * For parseable documents (text / markdown / PDF / DOCX / Excel)
+          inlines the extracted plain-text content into the message body.
+        * Returns ``(text_parts, [(local_path, mime), ...])``.  Callers
+          should append the second list to ``event.media_urls`` /
+          ``event.media_types`` so the downstream enrichment pipeline in
+          ``gateway/run.py`` picks them up (vision / STT / document note).
 
-        Returns a list of formatted content strings (one per media item).
+        Rich-text inline attachments are NOT handled here -- they are
+        surfaced through ``_extract_media()`` + ``_download_media_to_local()``
+        and parsed lazily by ``_inline_parse_document_media()``.
         """
         parts: List[str] = []
-        # (download_code_or_url, file_name, extra_text)
-        file_items: List[Tuple[str, str, str]] = []
+        downloaded: List[Tuple[str, str]] = []
 
         msg_type_str = getattr(message, "message_type", "") or ""
+        if msg_type_str not in ("file", "audio", "video"):
+            return parts, downloaded
+
         extensions = getattr(message, "extensions", {}) or {}
+        _raw = extensions.get("content", None)
+        if isinstance(_raw, str):
+            try:
+                _raw = json.loads(_raw)
+            except (ValueError, TypeError):
+                _raw = None
+        raw_content: Dict[str, Any] = _raw if isinstance(_raw, dict) else {}
 
-        # Helper: safely parse extensions['content'] dict
-        raw_content: Optional[Dict[str, Any]] = None
-        if msg_type_str in ("file", "audio", "video"):
-            _raw = extensions.get("content", None)
-            if isinstance(_raw, str):
-                try:
-                    _raw = json.loads(_raw)
-                except (ValueError, TypeError):
-                    _raw = None
-            if isinstance(_raw, dict):
-                raw_content = _raw
+        # Typed-attribute fallback (future SDK versions may expose
+        # file_content/audio_content/video_content directly).
+        if msg_type_str == "file" and not raw_content:
+            file_content = getattr(message, "file_content", None)
+            if file_content:
+                raw_content = {
+                    "downloadCode": getattr(file_content, "download_code", "") or "",
+                    "fileName": getattr(file_content, "file_name", "") or "",
+                }
 
-        # ---- 1. file message ----
-        if msg_type_str == "file" and raw_content:
-            dl_code = raw_content.get("downloadCode", "")
-            fname = raw_content.get("fileName", "")
-            if dl_code and fname:
-                file_items.append((dl_code, fname, ""))
-                logger.info(
-                    "[%s] Found file attachment: %s", self.name, fname,
-                )
+        dl_code = raw_content.get("downloadCode") or raw_content.get("download_code") or ""
+        fname_hint = raw_content.get("fileName") or raw_content.get("file_name") or ""
 
-        # ---- 2. audio message (extract recognition text) ----
-        if msg_type_str == "audio" and raw_content:
-            dl_code = raw_content.get("downloadCode", "")
-            fname = raw_content.get("fileName", "") or "audio.amr"
+        # -----------------------------------------------------------------
+        # audio: inject recognition text AND cache the audio file itself
+        # so the agent can re-transcribe / replay if it needs to.
+        # -----------------------------------------------------------------
+        if msg_type_str == "audio":
+            fname = fname_hint or "audio.amr"
             recognition = (
                 raw_content.get("recognition")
                 or raw_content.get("recognition_text")
                 or ""
             )
-            # Always inject recognition text as the primary content
             if recognition:
                 parts.append(
                     f"\U0001f3a4 **\u97f3\u9891**: {fname}\n"
@@ -2110,117 +2380,152 @@ class DingTalkAdapter(BasePlatformAdapter):
                 logger.info(
                     "[%s] Audio recognition: %d chars", self.name, len(recognition),
                 )
-            elif dl_code:
+
+            if dl_code:
+                local, mime = await self._resolve_and_cache_media(
+                    dl_code, kind="audio", hint_filename=fname, message=message,
+                )
+                if local:
+                    downloaded.append((local, mime))
+                    if not recognition:
+                        parts.append(
+                            f"\U0001f3a4 **\u97f3\u9891**: {fname}\n"
+                            f"\u2705 \u97f3\u9891\u6587\u4ef6\u5df2\u4fdd\u5b58\u81f3: {local}"
+                        )
+                elif not recognition:
+                    parts.append(
+                        f"\U0001f3a4 **\u97f3\u9891**: {fname}\n"
+                        f"\u26a0\ufe0f \u672a\u83b7\u53d6\u5230\u8bc6\u522b\u6587\u672c\uff0c\u4e14\u97f3\u9891\u6587\u4ef6\u4e0b\u8f7d\u5931\u8d25"
+                    )
+            elif not recognition:
                 parts.append(
                     f"\U0001f3a4 **\u97f3\u9891**: {fname}\n"
-                    f"\u2139\ufe0f \u8bed\u97f3\u6d88\u606f\uff0c\u672a\u83b7\u53d6\u5230\u8bc6\u522b\u6587\u672c"
+                    f"\u2139\ufe0f \u8bed\u97f3\u6d88\u606f\uff0c\u672a\u63d0\u4f9b\u4e0b\u8f7d\u51ed\u8bc1"
                 )
-            # Audio files are not text-parseable, skip download+parse.
 
-        # ---- 3. video message ----
-        if msg_type_str == "video" and raw_content:
-            dl_code = raw_content.get("downloadCode", "")
-            fname = raw_content.get("fileName", "") or "video.mp4"
+            return parts, downloaded
+
+        # -----------------------------------------------------------------
+        # video: cache into the video cache so the agent can read it.
+        # -----------------------------------------------------------------
+        if msg_type_str == "video":
+            fname = fname_hint or "video.mp4"
             if dl_code:
-                parts.append(
-                    f"\U0001f3ac **\u89c6\u9891**: {fname}\n"
-                    f"\u2139\ufe0f \u89c6\u9891\u6587\u4ef6\u5df2\u63a5\u6536"
+                local, mime = await self._resolve_and_cache_media(
+                    dl_code, kind="video", hint_filename=fname, message=message,
                 )
-            # Video files are not text-parseable, skip download+parse.
-
-        # ---- 4. Rich text items that are files (non-picture) ----
-        rich_text = getattr(message, "rich_text_content", None)
-        if rich_text:
-            rich_list = getattr(rich_text, "rich_text_list", []) or []
-            for item in rich_list:
-                if not isinstance(item, dict):
-                    continue
-                dl_code = (
-                    item.get("downloadCode")
-                    or item.get("download_code")
-                    or ""
-                )
-                fname = item.get("fileName") or item.get("file_name") or ""
-                item_type = item.get("type", "")
-                if dl_code and fname and item_type not in ("picture",):
-                    file_items.append((dl_code, fname, ""))
-
-        # ---- 5. Fallback: try typed attributes (future SDK) ----
-        if msg_type_str == "file" and not file_items:
-            file_content = getattr(message, "file_content", None)
-            if file_content:
-                dl_code = getattr(file_content, "download_code", None) or ""
-                fname = getattr(file_content, "file_name", None) or ""
-                if dl_code and fname:
-                    file_items.append((dl_code, fname, ""))
-
-        if not file_items and not parts:
-            return parts
-
-        # ---- Download + parse text-type files ----
-        if file_items:
-            token = await self._get_access_token()
-            robot_code = getattr(message, "robot_code", None) or self._client_id
-
-            for dl_code, fname, extra in file_items:
-                ext = os.path.splitext(fname)[1].lower()
-                label = _file_type_label(ext)
-
-                if ext not in _PARSEABLE_FILE_EXTS:
-                    # Binary file (video/audio/zip/etc.) — just acknowledge.
+                if local:
+                    downloaded.append((local, mime))
                     parts.append(
-                        f"\U0001f4ce **{label}**: {fname}\n"
-                        f"\u2139\ufe0f \u6587\u4ef6\u5df2\u63a5\u6536\uff0c\u4f46\u4e0d\u652f\u6301\u81ea\u52a8\u89e3\u6790"
+                        f"\U0001f3ac **\u89c6\u9891**: {fname}\n"
+                        f"\u2705 \u89c6\u9891\u5df2\u4fdd\u5b58\u81f3: {local}"
                     )
-                    continue
-
-                # Resolve downloadCode -> downloadUrl
-                download_url = dl_code
-                if not dl_code.startswith("http"):
-                    download_url = await self._resolve_single_download_url(
-                        dl_code, robot_code, token,
+                else:
+                    parts.append(
+                        f"\U0001f3ac **\u89c6\u9891**: {fname}\n"
+                        f"\u26a0\ufe0f \u89c6\u9891\u4e0b\u8f7d\u5931\u8d25"
                     )
-                if not download_url:
-                    parts.append(f"\u26a0\ufe0f \u6587\u4ef6\u83b7\u53d6\u5931\u8d25: {fname}")
-                    continue
+            return parts, downloaded
 
-                # Download to temp
-                tmp_path = await _download_file_to_temp(download_url, fname)
-                if not tmp_path:
-                    parts.append(f"\u26a0\ufe0f \u6587\u4ef6\u4e0b\u8f7d\u5931\u8d25: {fname}")
-                    continue
+        # -----------------------------------------------------------------
+        # file: always cache into the document cache; if the extension is
+        # parseable, also inline the extracted plain-text for the LLM.
+        # -----------------------------------------------------------------
+        if not dl_code:
+            return parts, downloaded
 
-                try:
-                    content = await asyncio.to_thread(
-                        _parse_file_content, tmp_path, fname,
-                    )
-                    if content:
-                        preview = (
-                            content[:200] + "..."
-                            if len(content) > 200
-                            else content
-                        )
-                        parts.append(
-                            f"\U0001f4c4 **{label}**: {fname}\n"
-                            f"\u2705 \u5df2\u89e3\u6790\u6587\u4ef6\u5185\u5bb9\uff08{len(content)} \u5b57\u7b26\uff09\n"
-                            f"\U0001f4dd \u5185\u5bb9\u9884\u89c8:\n```\n{preview}\n```\n\n"
-                            f"\U0001f4cb \u5b8c\u6574\u5185\u5bb9:\n{content}"
-                        )
-                        logger.info(
-                            "[%s] Parsed file %s: %d chars",
-                            self.name, fname, len(content),
-                        )
-                    else:
-                        parts.append(
-                            f"\U0001f4c4 **{label}**: {fname}\n"
-                            f"\u26a0\ufe0f \u6587\u4ef6\u89e3\u6790\u5931\u8d25\uff0c\u5185\u5bb9\u4e3a\u7a7a"
-                        )
-                finally:
-                    try:
-                        os.unlink(tmp_path)
-                    except OSError:
-                        pass
+        fname = fname_hint or "attachment.bin"
+        ext = os.path.splitext(fname)[1].lower()
+        label = _file_type_label(ext)
 
+        local, mime = await self._resolve_and_cache_media(
+            dl_code, kind="file", hint_filename=fname, message=message,
+        )
+        if not local:
+            parts.append(f"\u26a0\ufe0f \u6587\u4ef6\u4e0b\u8f7d\u5931\u8d25: {fname}")
+            return parts, downloaded
+
+        downloaded.append((local, mime))
+
+        if ext not in _PARSEABLE_FILE_EXTS:
+            parts.append(
+                f"\U0001f4ce **{label}**: {fname}\n"
+                f"\u2705 \u6587\u4ef6\u5df2\u4fdd\u5b58\u81f3: {local}"
+            )
+            return parts, downloaded
+
+        try:
+            content = await asyncio.to_thread(_parse_file_content, local, fname)
+        except Exception as exc:
+            logger.warning("[%s] Parse %s failed: %s", self.name, fname, exc)
+            content = None
+
+        if content:
+            preview = content[:200] + "..." if len(content) > 200 else content
+            parts.append(
+                f"\U0001f4c4 **{label}**: {fname}\n"
+                f"\u2705 \u5df2\u89e3\u6790\u6587\u4ef6\u5185\u5bb9\uff08{len(content)} \u5b57\u7b26\uff0c\u539f\u59cb\u6587\u4ef6: {local}\uff09\n"
+                f"\U0001f4dd \u5185\u5bb9\u9884\u89c8:\n```\n{preview}\n```\n\n"
+                f"\U0001f4cb \u5b8c\u6574\u5185\u5bb9:\n{content}"
+            )
+            logger.info("[%s] Parsed file %s: %d chars", self.name, fname, len(content))
+        else:
+            parts.append(
+                f"\U0001f4c4 **{label}**: {fname}\n"
+                f"\u26a0\ufe0f \u6587\u4ef6\u89e3\u6790\u5931\u8d25\uff0c\u539f\u59cb\u6587\u4ef6\u5df2\u4fdd\u5b58\u81f3: {local}"
+            )
+        return parts, downloaded
+
+    async def _inline_parse_document_media(
+        self, media_urls: List[str], media_types: List[str],
+    ) -> List[str]:
+        """Best-effort inline parse of documents already cached in media_urls.
+
+        Called *after* ``_download_media_to_local`` has pulled rich-text
+        inline files into the document cache.  For each entry whose MIME /
+        extension is parseable (PDF / DOCX / Excel / text), extracts plain
+        text and returns a formatted block so callers can append it to the
+        message body.  Failures are silent -- the file path is still in
+        ``media_urls`` so the agent can fall back to tool access.
+        """
+        parts: List[str] = []
+        for i, path in enumerate(media_urls):
+            if not path or not isinstance(path, str):
+                continue
+            if not os.path.isabs(path):
+                continue
+            if not os.path.exists(path):
+                continue
+
+            fname = os.path.basename(path)
+            # The document cache strips ``doc_{uuid}_`` prefix for display.
+            pretty = re.sub(r"^doc_[0-9a-f]{12}_", "", fname)
+            ext = os.path.splitext(pretty)[1].lower()
+            if ext not in _PARSEABLE_FILE_EXTS:
+                continue
+            mime = media_types[i] if i < len(media_types) else ""
+            # Only parse documents the _download_media_to_local layer tagged
+            # as non-image/audio/video media (i.e. application/... or text/...).
+            if mime.startswith(("image/", "audio/", "video/")):
+                continue
+
+            try:
+                content = await asyncio.to_thread(_parse_file_content, path, pretty)
+            except Exception as exc:
+                logger.warning("[%s] Inline parse %s failed: %s", self.name, pretty, exc)
+                continue
+            if not content:
+                continue
+
+            label = _file_type_label(ext)
+            preview = content[:200] + "..." if len(content) > 200 else content
+            parts.append(
+                f"\U0001f4c4 **{label}**: {pretty}\n"
+                f"\u2705 \u5df2\u89e3\u6790\u6587\u4ef6\u5185\u5bb9\uff08{len(content)} \u5b57\u7b26\uff0c\u539f\u59cb\u6587\u4ef6: {path}\uff09\n"
+                f"\U0001f4dd \u5185\u5bb9\u9884\u89c8:\n```\n{preview}\n```\n\n"
+                f"\U0001f4cb \u5b8c\u6574\u5185\u5bb9:\n{content}"
+            )
+            logger.info("[%s] Inline-parsed %s: %d chars", self.name, pretty, len(content))
         return parts
 
     async def _resolve_single_download_url(

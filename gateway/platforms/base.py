@@ -577,6 +577,40 @@ def cache_video_from_bytes(data: bytes, ext: str = ".mp4") -> str:
     return str(filepath)
 
 
+def cleanup_audio_cache(max_age_hours: int = 24) -> int:
+    """Delete cached audio files older than *max_age_hours*. Returns removed count."""
+    import time
+
+    cache_dir = get_audio_cache_dir()
+    cutoff = time.time() - (max_age_hours * 3600)
+    removed = 0
+    for f in cache_dir.iterdir():
+        if f.is_file() and f.stat().st_mtime < cutoff:
+            try:
+                f.unlink()
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
+def cleanup_video_cache(max_age_hours: int = 24) -> int:
+    """Delete cached video files older than *max_age_hours*. Returns removed count."""
+    import time
+
+    cache_dir = get_video_cache_dir()
+    cutoff = time.time() - (max_age_hours * 3600)
+    removed = 0
+    for f in cache_dir.iterdir():
+        if f.is_file() and f.stat().st_mtime < cutoff:
+            try:
+                f.unlink()
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
 # ---------------------------------------------------------------------------
 # Document cache utilities
 #
