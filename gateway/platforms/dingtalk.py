@@ -32,11 +32,13 @@ import logging
 import os
 import random
 import re
+import tempfile
 import time
 import traceback
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 try:
     import dingtalk_stream
@@ -261,6 +263,221 @@ DINGTALK_TYPE_MAPPING = {
     "picture": "image",
     "voice": "audio",
 }
+
+# ---------------------------------------------------------------------------
+# File content auto-parsing (ported from dingtalk-openclaw-connector
+# core/message-handler.ts:700-956)
+# ---------------------------------------------------------------------------
+
+# Extensions that can be parsed as plain text and injected into agent context.
+_TEXT_FILE_EXTS = frozenset({
+    ".txt", ".md", ".json", ".xml", ".yaml", ".yml", ".csv", ".log",
+    ".js", ".ts", ".py", ".java", ".c", ".cpp", ".h", ".sh", ".bat",
+    ".html", ".css", ".sql", ".rb", ".go", ".rs", ".toml", ".ini", ".cfg",
+})
+_DOCX_EXTS = frozenset({".docx", ".doc"})
+_PDF_EXTS = frozenset({".pdf"})
+_EXCEL_EXTS = frozenset({".xlsx", ".xls", ".xlsm"})
+# All parseable extensions (text + docx + pdf + excel).
+_PARSEABLE_FILE_EXTS = _TEXT_FILE_EXTS | _DOCX_EXTS | _PDF_EXTS | _EXCEL_EXTS
+
+
+def _file_type_label(ext: str) -> str:
+    """Return a human-readable Chinese label for a file extension."""
+    if ext in _TEXT_FILE_EXTS:
+        return "文本文件"
+    if ext in _DOCX_EXTS:
+        return "Word 文档"
+    if ext in _PDF_EXTS:
+        return "PDF 文档"
+    if ext in {".xlsx", ".xls"}:
+        return "Excel 表格"
+    if ext in {".pptx", ".ppt"}:
+        return "PPT 演示文稿"
+    if ext in {".zip", ".rar", ".7z", ".tar", ".gz"}:
+        return "压缩包"
+    if ext in _IMAGE_EXTS:
+        return "图片"
+    if ext in _VIDEO_EXTS:
+        return "视频"
+    if ext in _VOICE_EXTS:
+        return "音频"
+    return "文件"
+
+
+def _parse_text_file(file_path: str) -> Optional[str]:
+    """Read a plain-text file and return its content."""
+    try:
+        text = Path(file_path).read_text(encoding="utf-8", errors="replace").strip()
+        return text if text else None
+    except Exception as exc:
+        logger.warning("Failed to read text file %s: %s", file_path, exc)
+        return None
+
+
+def _parse_docx_file(file_path: str) -> Optional[str]:
+    """Extract raw text from a .docx file using python-docx."""
+    try:
+        import docx  # python-docx
+    except ImportError:
+        logger.warning(
+            "python-docx not installed, cannot parse .docx. "
+            "Install with: pip install python-docx"
+        )
+        return None
+    try:
+        doc = docx.Document(file_path)
+        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+        text = "\n".join(paragraphs).strip()
+        return text if text else None
+    except Exception as exc:
+        logger.warning("Failed to parse docx %s: %s", file_path, exc)
+        return None
+
+
+def _parse_pdf_file(file_path: str) -> Optional[str]:
+    """Extract text from a PDF file.
+
+    Tries pdfplumber first (better table / layout handling), then falls back
+    to PyPDF2.
+    """
+    # Try pdfplumber
+    try:
+        import pdfplumber
+        with pdfplumber.open(file_path) as pdf:
+            pages_text = [p.extract_text() or "" for p in pdf.pages]
+        text = "\n".join(pages_text).strip()
+        if text:
+            return text
+    except ImportError:
+        pass
+    except Exception as exc:
+        logger.warning("pdfplumber failed for %s: %s", file_path, exc)
+
+    # Fallback to PyPDF2
+    try:
+        from PyPDF2 import PdfReader
+        reader = PdfReader(file_path)
+        pages_text = [page.extract_text() or "" for page in reader.pages]
+        text = "\n".join(pages_text).strip()
+        return text if text else None
+    except ImportError:
+        logger.warning(
+            "Neither pdfplumber nor PyPDF2 installed, cannot parse PDF. "
+            "Install with: pip install pdfplumber  or  pip install PyPDF2"
+        )
+        return None
+    except Exception as exc:
+        logger.warning("PyPDF2 failed for %s: %s", file_path, exc)
+        return None
+
+
+def _parse_excel_file(file_path: str) -> Optional[str]:
+    """Extract text representation from an Excel (.xlsx/.xls/.xlsm) file.
+
+    Tries openpyxl first (modern xlsx), then falls back to xlrd (legacy xls).
+    Converts each sheet into a Markdown-style table so the LLM can reason
+    over the data directly.
+    """
+    # -- Try openpyxl (xlsx / xlsm) --
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+        sheets_text: List[str] = []
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            rows: List[List[str]] = []
+            for row in ws.iter_rows(values_only=True):
+                cells = [str(c) if c is not None else "" for c in row]
+                rows.append(cells)
+            if not rows:
+                continue
+            # Build markdown table
+            header = "| " + " | ".join(rows[0]) + " |"
+            sep = "| " + " | ".join(["---"] * len(rows[0])) + " |"
+            body_lines = []
+            for r in rows[1:]:
+                # Pad or truncate to header length
+                padded = r + [""] * (len(rows[0]) - len(r))
+                body_lines.append("| " + " | ".join(padded[:len(rows[0])]) + " |")
+            table = "\n".join([header, sep] + body_lines)
+            sheets_text.append(f"### Sheet: {sheet_name}\n\n{table}")
+        wb.close()
+        text = "\n\n".join(sheets_text).strip()
+        if text:
+            return text
+    except ImportError:
+        pass
+    except Exception as exc:
+        logger.warning("openpyxl failed for %s: %s", file_path, exc)
+
+    # -- Fallback: pandas (handles both xlsx and xls) --
+    try:
+        import pandas as pd
+        xls = pd.ExcelFile(file_path)
+        sheets_text = []
+        for sheet_name in xls.sheet_names:
+            df = pd.read_excel(xls, sheet_name=sheet_name)
+            md_table = df.to_markdown(index=False)
+            if md_table:
+                sheets_text.append(f"### Sheet: {sheet_name}\n\n{md_table}")
+        text = "\n\n".join(sheets_text).strip()
+        return text if text else None
+    except ImportError:
+        logger.warning(
+            "Neither openpyxl nor pandas installed, cannot parse Excel. "
+            "Install with: pip install openpyxl  or  pip install pandas"
+        )
+        return None
+    except Exception as exc:
+        logger.warning("pandas Excel parse failed for %s: %s", file_path, exc)
+        return None
+
+
+def _parse_file_content(file_path: str, file_name: str) -> Optional[str]:
+    """Dispatch to the correct parser based on file extension.
+
+    Returns the extracted text, or None if unparseable / binary.
+    """
+    ext = os.path.splitext(file_name)[1].lower()
+    if ext in _TEXT_FILE_EXTS:
+        return _parse_text_file(file_path)
+    if ext in _DOCX_EXTS:
+        return _parse_docx_file(file_path)
+    if ext in _PDF_EXTS:
+        return _parse_pdf_file(file_path)
+    if ext in _EXCEL_EXTS:
+        return _parse_excel_file(file_path)
+    return None
+
+
+async def _download_file_to_temp(
+    url: str, file_name: str, *, timeout: float = 60.0,
+) -> Optional[str]:
+    """Download *url* into a temp file preserving the original extension.
+
+    Returns the local path on success, None on failure.
+    """
+    if not HTTPX_AVAILABLE:
+        return None
+    try:
+        ext = os.path.splitext(file_name)[1] or ""
+        # Sanitise base name for temp file prefix
+        base = re.sub(r'[^\w.-]', '_', os.path.splitext(file_name)[0])[:80]
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+        # Write to a temp file that persists until explicitly deleted
+        fd, tmp_path = tempfile.mkstemp(suffix=ext, prefix=f"dt_{base}_")
+        try:
+            os.write(fd, resp.content)
+        finally:
+            os.close(fd)
+        logger.debug("Downloaded file %s (%d bytes) -> %s", file_name, len(resp.content), tmp_path)
+        return tmp_path
+    except Exception as exc:
+        logger.warning("Failed to download file %s: %s", file_name, exc)
+        return None
 
 
 async def _dingtalk_fetch_access_token(
@@ -1393,6 +1610,36 @@ class DingTalkAdapter(BasePlatformAdapter):
         # Determine message type and build media list
         msg_type, media_urls, media_types = self._extract_media(message)
 
+        logger.info(
+            "[%s] Pre-file-parse state: msg_type_str=%s text=%r media_urls=%d extensions_keys=%s",
+            self.name,
+            getattr(message, "message_type", "?"),
+            (text[:60] if text else ""),
+            len(media_urls),
+            list(getattr(message, "extensions", {}).keys())[:10],
+        )
+
+        # ------------------------------------------------------------------
+        # File content auto-parsing: download text-type files (.md, .txt,
+        # .json, .docx, .pdf, etc.) and inject their content into ``text``
+        # so the LLM can see the content immediately without needing tools.
+        # Mirrors dingtalk-openclaw-connector core/message-handler.ts:1226-1328.
+        # ------------------------------------------------------------------
+        try:
+            file_parts = await self._extract_and_parse_file_attachments(message)
+            if file_parts:
+                file_text = "\n\n".join(file_parts)
+                text = f"{text}\n\n{file_text}" if text else file_text
+                logger.info(
+                    "[%s] Injected %d file content block(s) into message text",
+                    self.name, len(file_parts),
+                )
+        except Exception:
+            logger.warning(
+                "[%s] File content extraction failed (non-fatal), continuing",
+                self.name, exc_info=True,
+            )
+
         if not text and not media_urls:
             logger.debug("[%s] Empty message, skipping", self.name)
             return
@@ -1605,6 +1852,35 @@ class DingTalkAdapter(BasePlatformAdapter):
         # (alice@example.com), SSH URLs (git@github.com), and literal
         # references the user wrote ("what does @openai think").  Let the
         # LLM see the raw text — it handles "@bot hello" cleanly.
+
+        # -----------------------------------------------------------------
+        # For message types that the SDK does NOT parse into typed attrs
+        # (audio / video / file), extract a reasonable text placeholder from
+        # extensions['content'].  Matches connector's extractMessageContent.
+        # -----------------------------------------------------------------
+        if not content:
+            msg_type_str = getattr(message, "message_type", "") or ""
+            ext_content = (getattr(message, "extensions", {}) or {}).get("content", None)
+            if isinstance(ext_content, str):
+                try:
+                    ext_content = json.loads(ext_content)
+                except (ValueError, TypeError):
+                    ext_content = None
+            if isinstance(ext_content, dict):
+                if msg_type_str == "audio":
+                    content = (
+                        ext_content.get("recognition")
+                        or ext_content.get("recognition_text")
+                        or "[语音消息]"
+                    )
+                elif msg_type_str == "video":
+                    content = "[视频]"
+                elif msg_type_str == "file":
+                    fname = ext_content.get("fileName", "文件")
+                    content = f"[文件: {fname}]"
+                elif msg_type_str == "markdown":
+                    content = ext_content.get("text", "").strip() or "[markdown消息]"
+
         return content
 
     def _extract_media(self, message: "ChatbotMessage"):
@@ -1666,6 +1942,229 @@ class DingTalkAdapter(BasePlatformAdapter):
             )
 
         return msg_type, media_urls, media_types
+
+    async def _extract_and_parse_file_attachments(
+        self, message: "ChatbotMessage",
+    ) -> List[str]:
+        """Download and parse ALL rich-media attachments from the message.
+
+        Mirrors dingtalk-openclaw-connector core/message-handler.ts:350-598
+        (extractMessageContent) and L1226-1328 (file download + parse).
+
+        Handles:
+          * msgtype='file'  → download + parse text-type files
+          * msgtype='audio' → extract recognition text + note file info
+          * msgtype='video' → note file info
+          * richText items   → download + parse files embedded in rich text
+
+        CRITICAL: The dingtalk-stream SDK's ChatbotMessage.from_dict() only
+        handles 'text', 'picture', 'richText'.  For 'file', 'audio', 'video'
+        the raw ``content`` dict lives in ``message.extensions['content']``.
+
+        Returns a list of formatted content strings (one per media item).
+        """
+        parts: List[str] = []
+        # (download_code_or_url, file_name, extra_text)
+        file_items: List[Tuple[str, str, str]] = []
+
+        msg_type_str = getattr(message, "message_type", "") or ""
+        extensions = getattr(message, "extensions", {}) or {}
+
+        # Helper: safely parse extensions['content'] dict
+        raw_content: Optional[Dict[str, Any]] = None
+        if msg_type_str in ("file", "audio", "video"):
+            _raw = extensions.get("content", None)
+            if isinstance(_raw, str):
+                try:
+                    _raw = json.loads(_raw)
+                except (ValueError, TypeError):
+                    _raw = None
+            if isinstance(_raw, dict):
+                raw_content = _raw
+
+        # ---- 1. file message ----
+        if msg_type_str == "file" and raw_content:
+            dl_code = raw_content.get("downloadCode", "")
+            fname = raw_content.get("fileName", "")
+            if dl_code and fname:
+                file_items.append((dl_code, fname, ""))
+                logger.info(
+                    "[%s] Found file attachment: %s", self.name, fname,
+                )
+
+        # ---- 2. audio message (extract recognition text) ----
+        if msg_type_str == "audio" and raw_content:
+            dl_code = raw_content.get("downloadCode", "")
+            fname = raw_content.get("fileName", "") or "audio.amr"
+            recognition = (
+                raw_content.get("recognition")
+                or raw_content.get("recognition_text")
+                or ""
+            )
+            # Always inject recognition text as the primary content
+            if recognition:
+                parts.append(
+                    f"\U0001f3a4 **\u97f3\u9891**: {fname}\n"
+                    f"\U0001f4dd \u8bed\u97f3\u8bc6\u522b\u7ed3\u679c:\n{recognition}"
+                )
+                logger.info(
+                    "[%s] Audio recognition: %d chars", self.name, len(recognition),
+                )
+            elif dl_code:
+                parts.append(
+                    f"\U0001f3a4 **\u97f3\u9891**: {fname}\n"
+                    f"\u2139\ufe0f \u8bed\u97f3\u6d88\u606f\uff0c\u672a\u83b7\u53d6\u5230\u8bc6\u522b\u6587\u672c"
+                )
+            # Audio files are not text-parseable, skip download+parse.
+
+        # ---- 3. video message ----
+        if msg_type_str == "video" and raw_content:
+            dl_code = raw_content.get("downloadCode", "")
+            fname = raw_content.get("fileName", "") or "video.mp4"
+            if dl_code:
+                parts.append(
+                    f"\U0001f3ac **\u89c6\u9891**: {fname}\n"
+                    f"\u2139\ufe0f \u89c6\u9891\u6587\u4ef6\u5df2\u63a5\u6536"
+                )
+            # Video files are not text-parseable, skip download+parse.
+
+        # ---- 4. Rich text items that are files (non-picture) ----
+        rich_text = getattr(message, "rich_text_content", None)
+        if rich_text:
+            rich_list = getattr(rich_text, "rich_text_list", []) or []
+            for item in rich_list:
+                if not isinstance(item, dict):
+                    continue
+                dl_code = (
+                    item.get("downloadCode")
+                    or item.get("download_code")
+                    or ""
+                )
+                fname = item.get("fileName") or item.get("file_name") or ""
+                item_type = item.get("type", "")
+                if dl_code and fname and item_type not in ("picture",):
+                    file_items.append((dl_code, fname, ""))
+
+        # ---- 5. Fallback: try typed attributes (future SDK) ----
+        if msg_type_str == "file" and not file_items:
+            file_content = getattr(message, "file_content", None)
+            if file_content:
+                dl_code = getattr(file_content, "download_code", None) or ""
+                fname = getattr(file_content, "file_name", None) or ""
+                if dl_code and fname:
+                    file_items.append((dl_code, fname, ""))
+
+        if not file_items and not parts:
+            return parts
+
+        # ---- Download + parse text-type files ----
+        if file_items:
+            token = await self._get_access_token()
+            robot_code = getattr(message, "robot_code", None) or self._client_id
+
+            for dl_code, fname, extra in file_items:
+                ext = os.path.splitext(fname)[1].lower()
+                label = _file_type_label(ext)
+
+                if ext not in _PARSEABLE_FILE_EXTS:
+                    # Binary file (video/audio/zip/etc.) — just acknowledge.
+                    parts.append(
+                        f"\U0001f4ce **{label}**: {fname}\n"
+                        f"\u2139\ufe0f \u6587\u4ef6\u5df2\u63a5\u6536\uff0c\u4f46\u4e0d\u652f\u6301\u81ea\u52a8\u89e3\u6790"
+                    )
+                    continue
+
+                # Resolve downloadCode -> downloadUrl
+                download_url = dl_code
+                if not dl_code.startswith("http"):
+                    download_url = await self._resolve_single_download_url(
+                        dl_code, robot_code, token,
+                    )
+                if not download_url:
+                    parts.append(f"\u26a0\ufe0f \u6587\u4ef6\u83b7\u53d6\u5931\u8d25: {fname}")
+                    continue
+
+                # Download to temp
+                tmp_path = await _download_file_to_temp(download_url, fname)
+                if not tmp_path:
+                    parts.append(f"\u26a0\ufe0f \u6587\u4ef6\u4e0b\u8f7d\u5931\u8d25: {fname}")
+                    continue
+
+                try:
+                    content = await asyncio.to_thread(
+                        _parse_file_content, tmp_path, fname,
+                    )
+                    if content:
+                        preview = (
+                            content[:200] + "..."
+                            if len(content) > 200
+                            else content
+                        )
+                        parts.append(
+                            f"\U0001f4c4 **{label}**: {fname}\n"
+                            f"\u2705 \u5df2\u89e3\u6790\u6587\u4ef6\u5185\u5bb9\uff08{len(content)} \u5b57\u7b26\uff09\n"
+                            f"\U0001f4dd \u5185\u5bb9\u9884\u89c8:\n```\n{preview}\n```\n\n"
+                            f"\U0001f4cb \u5b8c\u6574\u5185\u5bb9:\n{content}"
+                        )
+                        logger.info(
+                            "[%s] Parsed file %s: %d chars",
+                            self.name, fname, len(content),
+                        )
+                    else:
+                        parts.append(
+                            f"\U0001f4c4 **{label}**: {fname}\n"
+                            f"\u26a0\ufe0f \u6587\u4ef6\u89e3\u6790\u5931\u8d25\uff0c\u5185\u5bb9\u4e3a\u7a7a"
+                        )
+                finally:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+
+        return parts
+
+    async def _resolve_single_download_url(
+        self, code: str, robot_code: str, token: Optional[str],
+    ) -> Optional[str]:
+        """Resolve a single downloadCode to a downloadUrl.
+
+        Wraps the Robot SDK call without mutating any message attribute.
+        """
+        if not token or not self._robot_sdk:
+            # Fallback: try direct HTTP with httpx
+            if HTTPX_AVAILABLE and token:
+                try:
+                    async with httpx.AsyncClient(timeout=30.0) as client:
+                        resp = await client.post(
+                            "https://api.dingtalk.com/v1.0/robot/messageFiles/download",
+                            json={"downloadCode": code, "robotCode": robot_code},
+                            headers={
+                                "x-acs-dingtalk-access-token": token,
+                                "Content-Type": "application/json",
+                            },
+                        )
+                    body = resp.json()
+                    return body.get("downloadUrl")
+                except Exception as exc:
+                    logger.warning("[%s] httpx fallback download failed: %s", self.name, exc)
+            return None
+        try:
+            request = dingtalk_robot_models.RobotMessageFileDownloadRequest(
+                download_code=code,
+                robot_code=robot_code,
+            )
+            headers = dingtalk_robot_models.RobotMessageFileDownloadHeaders(
+                x_acs_dingtalk_access_token=token,
+            )
+            runtime = tea_util_models.RuntimeOptions()
+            response = await self._robot_sdk.robot_message_file_download_with_options_async(
+                request, headers, runtime,
+            )
+            body = response.body if response else None
+            return getattr(body, "download_url", None) if body else None
+        except Exception as exc:
+            logger.warning("[%s] Failed to resolve download code: %s", self.name, exc)
+            return None
 
     # -- Outbound messaging -------------------------------------------------
 
