@@ -1620,6 +1620,27 @@ class DingTalkAdapter(BasePlatformAdapter):
         )
 
         # ------------------------------------------------------------------
+        # Download remote image URLs to local files.
+        #
+        # DingTalk's signed OSS URLs are not universally accessible — the
+        # vision_analyze_tool fails when it tries to download them directly
+        # because the OSS signature is bound to specific request context.
+        # Mirrors connector's downloadImageToFile / downloadMediaByCode
+        # approach: download in the gateway process (same IP/context as the
+        # DingTalk SDK) and pass local file paths to the agent.
+        # ------------------------------------------------------------------
+        if media_urls:
+            try:
+                media_urls = await self._download_images_to_local(
+                    media_urls, media_types, message,
+                )
+            except Exception:
+                logger.warning(
+                    "[%s] Image download to local failed (non-fatal), keeping URLs",
+                    self.name, exc_info=True,
+                )
+
+        # ------------------------------------------------------------------
         # File content auto-parsing: download text-type files (.md, .txt,
         # .json, .docx, .pdf, etc.) and inject their content into ``text``
         # so the LLM can see the content immediately without needing tools.
@@ -1942,6 +1963,85 @@ class DingTalkAdapter(BasePlatformAdapter):
             )
 
         return msg_type, media_urls, media_types
+
+    async def _download_images_to_local(
+        self,
+        media_urls: List[str],
+        media_types: List[str],
+        message: "ChatbotMessage",
+    ) -> List[str]:
+        """Download remote image URLs to local temp files.
+
+        DingTalk's ``_resolve_media_codes`` replaces download codes with signed
+        OSS URLs.  These signed URLs are **not universally accessible** — the
+        OSS signature may be bound to specific request headers, IP ranges, or
+        Referer, so the downstream ``vision_analyze_tool`` (which runs in a
+        different network context) consistently fails with "Invalid image
+        source" or HTTP 403.
+
+        The reference connector (dingtalk-openclaw-connector) avoids this by
+        downloading images to local files first and passing ``file://`` paths.
+        We mirror that approach here: for each image in *media_urls*, download
+        via httpx (which runs in the same process as the DingTalk SDK and
+        therefore shares the same network/IP context) and replace the URL with
+        the local temp-file path.
+
+        Non-image entries and entries that fail to download are left unchanged.
+        """
+        result = list(media_urls)  # shallow copy
+        robot_code = getattr(message, "robot_code", None) or self._client_id
+        token: Optional[str] = None  # lazy-fetched
+
+        for i, url in enumerate(media_urls):
+            mtype = media_types[i] if i < len(media_types) else ""
+            if mtype != "image":
+                continue  # only process images
+
+            try:
+                download_url = url
+                # If URL is still a download code (not http), resolve it first
+                if not url.startswith("http"):
+                    if token is None:
+                        token = await self._get_access_token()
+                    download_url = await self._resolve_single_download_url(
+                        url, robot_code, token,
+                    )
+                    if not download_url:
+                        logger.warning(
+                            "[%s] Failed to resolve image download code, keeping original",
+                            self.name,
+                        )
+                        continue
+
+                # Download to temp file
+                ext = ".png"  # safe default for images
+                # Try to detect from URL path (before query params)
+                url_path = download_url.split("?")[0]
+                for img_ext in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"):
+                    if url_path.lower().endswith(img_ext):
+                        ext = img_ext
+                        break
+
+                local_path = await _download_file_to_temp(
+                    download_url, f"image{ext}", timeout=30.0,
+                )
+                if local_path:
+                    result[i] = local_path
+                    logger.info(
+                        "[%s] Downloaded image to local: %s -> %s",
+                        self.name, url[:60], local_path,
+                    )
+                else:
+                    logger.warning(
+                        "[%s] Image download failed, keeping original URL: %s",
+                        self.name, url[:80],
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Image download error (non-fatal): %s", self.name, exc,
+                )
+
+        return result
 
     async def _extract_and_parse_file_attachments(
         self, message: "ChatbotMessage",
